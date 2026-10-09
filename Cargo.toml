@@ -3,7 +3,7 @@ name = "macula-craft-collab"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "The Macula mesh transport for the shared Craft collaboration seam: document text edits, cursor presence and join snapshots over macula-rust (released crates only)."
+description = "The Macula mesh transport for the shared Craft collaboration seam: document text edits, cursor presence, join snapshots and persistent identity over macula-rust (released crates only)."
 publish = false
 
 [dependencies]
@@ -12,5 +12,12 @@ craft-collab = { path = "../../rgfaber/craft-libs/crates/collab" }
 # released crates only
 macula-rust = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+
+[dev-dependencies]
+# same versions macula-rust uses, so the fake KeyStore in tests is its trait's types
+macula-mldsa = "0.3"
+keyring = "4"
+tempfile = "3"

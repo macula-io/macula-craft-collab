@@ -1018,8 +1018,12 @@ version = "0.1.0"
 dependencies = [
  "craft-collab",
  "hex",
+ "keyring",
+ "macula-mldsa",
  "macula-rust",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

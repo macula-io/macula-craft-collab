@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use craft_collab::{Kind, Message, Transport};
-use macula_craft_collab::{MeshConfig, MeshTransport};
+use macula_craft_collab::{Identity, MeshConfig, MeshTransport};
 
 fn arg(i: usize) -> String {
     std::env::args().nth(i).unwrap_or_else(|| {
@@ -40,9 +40,25 @@ fn main() {
         station_node_id: station,
         realm_id: realm,
         realm_key: Vec::new(),
-        profile: "pq_hybrid".into(),
     };
-    let mut mesh = match MeshTransport::connect(&cfg) {
+    let slug: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let identity = match Identity::load_or_create("pq_hybrid", &slug, &label) {
+        Ok(identity) => identity,
+        Err(e) => {
+            eprintln!("{label}: identity failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut mesh = match MeshTransport::connect(&cfg, &identity) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{label}: connect failed: {e}");
@@ -50,7 +66,7 @@ fn main() {
         }
     };
     let author = mesh.author();
-    println!("{label}: connected as {}", &author[..8]);
+    println!("{label}: connected as {}", &author[..8.min(author.len())]);
 
     if mode == "send" || mode == "both" {
         let msg = Message {

@@ -9,6 +9,10 @@
 //! `craft/collab/document_shared_v1`; the document id, author and payload are
 //! in the message itself.
 
+pub mod identity;
+
+pub use identity::Identity;
+
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -16,7 +20,6 @@ use craft_collab::{Kind, Message, Transport};
 use macula_rust::cbor::Value;
 use macula_rust::node_key::NodeKey;
 use macula_rust::pool::{Opts, Pool, Seed};
-use macula_rust::profile::Profile;
 use macula_rust::station_link::Publication;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -29,8 +32,8 @@ const TOPIC_SHARED: &str = "craft/collab/document_shared_v1";
 /// Where replayed commands travel.
 const TOPIC_COMMAND: &str = "craft/collab/command_applied_v1";
 
-/// How to reach the shared document's realm: the seed station, the realm and
-/// its key, and the crypto profile both sides run (`pq_pure` or `pq_hybrid`).
+/// How to reach the shared document's realm: the seed station and the realm.
+/// The identity (key and node id) comes from [`Identity`].
 #[derive(Clone, Debug)]
 pub struct MeshConfig {
     pub host: String,
@@ -38,9 +41,9 @@ pub struct MeshConfig {
     /// The seed station's node id, as carried.
     pub station_node_id: [u8; 32],
     pub realm_id: [u8; 32],
-    /// The realm's key as carried (advertisements are checked against it).
+    /// The realm's key as carried (advertisements are checked against it);
+    /// empty trusts nothing, which pubsub does not need.
     pub realm_key: Vec<u8>,
-    pub profile: String,
 }
 
 /// One node's view of a shared document, over the mesh.
@@ -56,12 +59,15 @@ enum Outbound {
 }
 
 impl MeshTransport {
-    /// Connects this node to the mesh and starts listening. Returns once the
-    /// first link is up, or the pool's connect timeout passes.
-    pub fn connect(cfg: &MeshConfig) -> Result<MeshTransport, String> {
+    /// Connects this node to the mesh, as `identity`, and starts listening.
+    /// Returns once the first link is up, or the pool's connect timeout
+    /// passes.
+    pub fn connect(cfg: &MeshConfig, identity: &Identity) -> Result<MeshTransport, String> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (in_tx, in_rx) = std::sync::mpsc::channel::<Message>();
         let cfg = cfg.clone();
+        let author = identity.node_id().to_string();
+        let key = identity.key();
         std::thread::Builder::new()
             .name("macula-craft-collab".into())
             .spawn(move || {
@@ -75,11 +81,11 @@ impl MeshTransport {
                         return;
                     }
                 };
-                rt.block_on(run(cfg, in_tx, ready_tx));
+                rt.block_on(run(cfg, key, in_tx, ready_tx));
             })
             .map_err(|e| format!("thread: {e}"))?;
         match ready_rx.recv() {
-            Ok(Ok((author, out))) => Ok(MeshTransport {
+            Ok(Ok(out)) => Ok(MeshTransport {
                 author,
                 out,
                 incoming: in_rx,
@@ -94,31 +100,11 @@ impl MeshTransport {
 /// the loop ends and the pool closes.
 async fn run(
     cfg: MeshConfig,
+    key: Arc<NodeKey>,
     in_tx: Sender<Message>,
-    ready: std::sync::mpsc::Sender<Result<(String, UnboundedSender<Outbound>), String>>,
+    ready: std::sync::mpsc::Sender<Result<UnboundedSender<Outbound>, String>>,
 ) {
-    let profile = match Profile::parse(&cfg.profile) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = ready.send(Err(format!("profile: {e}")));
-            return;
-        }
-    };
-    let key = match NodeKey::generate_identity(profile, macula_rust::node_key::PUZZLE_DIFFICULTY) {
-        Ok(key) => key,
-        Err(e) => {
-            let _ = ready.send(Err(format!("identity: {e:?}")));
-            return;
-        }
-    };
-    let author = match key.node_id() {
-        Ok(id) => hex::encode(id),
-        Err(e) => {
-            let _ = ready.send(Err(format!("identity: {e:?}")));
-            return;
-        }
-    };
-    let mut opts = Opts::new(Arc::new(key));
+    let mut opts = Opts::new(key);
     // Pubsub needs no realm trust: it is only consulted when a call resolves
     // an advertisement. An empty key means "trust nothing in this realm".
     if !cfg.realm_key.is_empty() {
@@ -160,7 +146,7 @@ async fn run(
         });
     }
     // The transport holds the only sender; when it drops, the channel ends.
-    let _ = ready.send(Ok((author, out_tx)));
+    let _ = ready.send(Ok(out_tx));
 
     let realm = cfg.realm_id;
     while let Some(out) = out_rx.recv().await {
