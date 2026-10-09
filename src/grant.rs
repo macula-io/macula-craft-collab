@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
-use craft_collab::{Access, GRANT_VERSION, Grant, GrantVerifier, SignedGrant};
+use craft_collab::{
+    Access, GRANT_VERSION, Grant, GrantVerifier, Revocation, SignedGrant, SignedRevocation,
+};
 use macula_rust::node_key::node_id_of;
 use macula_rust::profile::Profile;
 
@@ -74,19 +76,47 @@ impl GrantVerifier for KeyGrantVerifier {
     fn verify(&self, signed: &SignedGrant, now_ms: u64) -> Result<Grant, String> {
         verify_grant(signed, &self.host_carried_key, self.profile, now_ms)
     }
+
+    fn verify_revocation(
+        &self,
+        signed: &SignedRevocation,
+        now_ms: u64,
+    ) -> Result<Revocation, String> {
+        let bytes = signed.revocation.signed_bytes()?;
+        if !macula_rust::node_key::verify(
+            &bytes,
+            &signed.signature,
+            &self.host_carried_key,
+            self.profile,
+        ) {
+            return Err("the revocation's signature does not verify under the host key".into());
+        }
+        let host_id = node_id_of(&self.host_carried_key, self.profile);
+        let host_hex: String = host_id.iter().map(|b| format!("{b:02x}")).collect();
+        if host_hex != signed.revocation.host {
+            return Err("the revocation names a host that did not sign it".into());
+        }
+        if signed.revocation.v != GRANT_VERSION {
+            return Err(format!(
+                "unsupported revocation version {}",
+                signed.revocation.v
+            ));
+        }
+        let _ = now_ms;
+        Ok(signed.revocation.clone())
+    }
 }
 
 /// An access table for `doc` whose grants install only when signed by the
-/// host that owns `host_carried_key`.
-pub fn verified_access(
-    doc: &str,
-    host: &str,
-    host_carried_key: Vec<u8>,
-    profile: Profile,
-) -> Access {
+/// host that owns `host_carried_key`. The host id is derived from that key
+/// (never passed in), so the table can never name a host the key does not
+/// prove.
+pub fn verified_access(doc: &str, host_carried_key: Vec<u8>, profile: Profile) -> Access {
+    let host_id = node_id_of(&host_carried_key, profile);
+    let host_hex: String = host_id.iter().map(|b| format!("{b:02x}")).collect();
     Access::new(
         doc,
-        host,
+        &host_hex,
         Arc::new(KeyGrantVerifier::new(host_carried_key, profile)),
     )
 }
@@ -167,8 +197,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let host = at(dir.path(), "host", "Host");
         let attacker = at(dir.path(), "attacker", "Attacker");
-        let mut access =
-            verified_access("demo", host.node_id(), host.carried_key(), Profile::PqPure);
+        let mut access = verified_access("demo", host.carried_key(), Profile::PqPure);
 
         // A stranger self-asserting Editor with no signature: refused.
         let self_asserted = SignedGrant {

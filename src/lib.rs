@@ -11,9 +11,11 @@
 
 pub mod grant;
 pub mod identity;
+pub mod issuer;
 
 pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verify_grant};
 pub use identity::Identity;
+pub use issuer::IdentityIssuer;
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -32,7 +34,14 @@ const TOPIC_CURSOR: &str = "craft/collab/cursor_moved_v1";
 /// Where join snapshots travel.
 const TOPIC_SHARED: &str = "craft/collab/document_shared_v1";
 /// Where replayed commands travel.
+/// Where command ops travel.
 const TOPIC_COMMAND: &str = "craft/collab/command_applied_v1";
+/// Where join requests travel.
+const TOPIC_JOIN: &str = "craft/collab/join_requested_v1";
+/// Where issued grants travel.
+const TOPIC_GRANT: &str = "craft/collab/grant_issued_v1";
+/// Where revocations travel.
+const TOPIC_REVOKE: &str = "craft/collab/holder_revoked_v1";
 
 /// How to reach the shared document's realm: the seed station and the realm.
 /// The identity (key and node id) comes from [`Identity`].
@@ -142,7 +151,15 @@ async fn run(
     };
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
-    for topic in [TOPIC_TEXT, TOPIC_CURSOR, TOPIC_SHARED, TOPIC_COMMAND] {
+    for topic in [
+        TOPIC_TEXT,
+        TOPIC_CURSOR,
+        TOPIC_SHARED,
+        TOPIC_COMMAND,
+        TOPIC_JOIN,
+        TOPIC_GRANT,
+        TOPIC_REVOKE,
+    ] {
         let Ok(mut sub) = pool.subscribe(&cfg.realm_id, topic).await else {
             let _ = ready.send(Err(format!("subscribe {topic}")));
             return;
@@ -221,6 +238,9 @@ fn topic_for(kind: &Kind) -> &'static str {
         Kind::TextEdit { .. } => TOPIC_TEXT,
         Kind::CursorMoved { .. } => TOPIC_CURSOR,
         Kind::Command { .. } => TOPIC_COMMAND,
+        Kind::JoinRequest { .. } => TOPIC_JOIN,
+        Kind::GrantIssued { .. } => TOPIC_GRANT,
+        Kind::Revoked { .. } => TOPIC_REVOKE,
         Kind::SnapshotRequest {} | Kind::Snapshot { .. } => TOPIC_SHARED,
     }
 }

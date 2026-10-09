@@ -40,6 +40,7 @@ struct Meta {
 }
 
 /// One person's Craft identity on this device.
+#[derive(Clone)]
 pub struct Identity {
     key: Arc<NodeKey>,
     node_id: String,
@@ -77,6 +78,12 @@ impl Identity {
     /// signatures made as this identity (grants, invites).
     pub fn carried_key(&self) -> Vec<u8> {
         self.key.public_key()
+    }
+
+    /// An access table for `doc` on this identity's side: its own key is
+    /// the trust root, so the table cannot be pointed at another host.
+    pub fn verified_access(&self, doc: &str) -> craft_collab::Access {
+        crate::grant::verified_access(doc, self.carried_key(), self.key.profile())
     }
 
     /// Signs `message` as this identity.
