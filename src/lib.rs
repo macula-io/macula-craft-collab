@@ -13,7 +13,7 @@ pub mod grant;
 pub mod identity;
 pub mod issuer;
 
-pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verify_grant};
+pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verified_access_from, verify_grant};
 pub use identity::Identity;
 pub use issuer::IdentityIssuer;
 
