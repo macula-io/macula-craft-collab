@@ -26,6 +26,8 @@ const TOPIC_TEXT: &str = "craft/collab/text_edited_v1";
 const TOPIC_CURSOR: &str = "craft/collab/cursor_moved_v1";
 /// Where join snapshots travel.
 const TOPIC_SHARED: &str = "craft/collab/document_shared_v1";
+/// Where replayed commands travel.
+const TOPIC_COMMAND: &str = "craft/collab/command_applied_v1";
 
 /// How to reach the shared document's realm: the seed station, the realm and
 /// its key, and the crypto profile both sides run (`pq_pure` or `pq_hybrid`).
@@ -117,7 +119,11 @@ async fn run(
         }
     };
     let mut opts = Opts::new(Arc::new(key));
-    opts.realm_trust.insert(cfg.realm_id, cfg.realm_key.clone());
+    // Pubsub needs no realm trust: it is only consulted when a call resolves
+    // an advertisement. An empty key means "trust nothing in this realm".
+    if !cfg.realm_key.is_empty() {
+        opts.realm_trust.insert(cfg.realm_id, cfg.realm_key.clone());
+    }
     let seeds = vec![Seed {
         host: cfg.host.clone(),
         port: cfg.port,
@@ -132,7 +138,7 @@ async fn run(
     };
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
-    for topic in [TOPIC_TEXT, TOPIC_CURSOR, TOPIC_SHARED] {
+    for topic in [TOPIC_TEXT, TOPIC_CURSOR, TOPIC_SHARED, TOPIC_COMMAND] {
         let Ok(mut sub) = pool.subscribe(&cfg.realm_id, topic).await else {
             let _ = ready.send(Err(format!("subscribe {topic}")));
             return;
@@ -198,6 +204,7 @@ fn topic_for(kind: &Kind) -> &'static str {
     match kind {
         Kind::TextEdit { .. } => TOPIC_TEXT,
         Kind::CursorMoved { .. } => TOPIC_CURSOR,
+        Kind::Command { .. } => TOPIC_COMMAND,
         Kind::SnapshotRequest {} | Kind::Snapshot { .. } => TOPIC_SHARED,
     }
 }
