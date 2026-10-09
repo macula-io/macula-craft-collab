@@ -61,6 +61,10 @@ fn main() {
     let forger = mesh.author().to_string();
     println!("forger: connected as {}", &forger[..8.min(forger.len())]);
 
+    // `self` makes the claim honest (the payload author IS the envelope's):
+    // a relay check — the cursor must arrive under `forged_name`.
+    let victim = if victim == "self" { forger.clone() } else { victim };
+
     // The claim: the payload's author is the victim, the envelope's is us.
     let msg = Message {
         doc,
