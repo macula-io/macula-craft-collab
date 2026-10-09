@@ -92,6 +92,45 @@ impl GrantIssuer for IdentityIssuer {
     ) -> Result<SignedGrant, String> {
         self.issue(doc, "", role, ttl_ms, now_ms)
     }
+
+    fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        self.identity.sign(bytes)
+    }
+}
+
+/// Verifies an invite envelope's host signature: the signature must verify
+/// under the envelope's own carried key (that is the anchor), the host id
+/// must be the one that key names, and the version must be current. This is
+/// what a joiner checks before it connects anywhere.
+pub fn verify_invite(invite: &craft_collab::Invite) -> Result<(), String> {
+    if invite.v != craft_collab::INVITE_VERSION {
+        return Err(format!("unsupported invite version {}", invite.v));
+    }
+    if invite.signature.is_empty() {
+        return Err("the invite is not signed".into());
+    }
+    let key = hex_bytes(&invite.host_key)?;
+    let profile = macula_rust::profile::Profile::parse(&invite.profile).map_err(|e| format!("profile: {e}"))?;
+    let bytes = invite.signed_bytes()?;
+    if !macula_rust::node_key::verify(&bytes, &invite.signature, &key, profile) {
+        return Err("the invite's signature does not verify under its host key".into());
+    }
+    let host_id = macula_rust::node_key::node_id_of(&key, profile);
+    let host_hex: String = host_id.iter().map(|b| format!("{b:02x}")).collect();
+    if host_hex != invite.host {
+        return Err("the invite names a host that did not sign it".into());
+    }
+    Ok(())
+}
+
+fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    if !s.len().is_multiple_of(2) {
+        return Err("an odd number of hex digits".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -103,6 +142,51 @@ mod tests {
     fn identity(dir: &std::path::Path, slug: &str) -> Identity {
         Identity::load_or_create_with(Profile::PqPure, slug, "Host", None, Some(dir))
             .expect("identity")
+    }
+
+    #[test]
+    fn invites_verify_only_when_signed_by_the_named_host() {
+        use craft_collab::{Invite, INVITE_VERSION};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let id = identity(dir.path(), "host");
+        let issuer = IdentityIssuer::new(id.clone());
+        let token = issuer.open_token("demo", Role::Editor, 60_000, 1_000).expect("token");
+        let mut invite = Invite {
+            v: INVITE_VERSION,
+            doc: "demo".into(),
+            host: id.node_id().to_string(),
+            host_key: id.carried_key().iter().map(|b| format!("{b:02x}")).collect(),
+            host_name: "Host".into(),
+            realm: "aa".repeat(32),
+            realm_key: String::new(),
+            profile: "pq_pure".into(),
+            seed: "station.example:4433:bb".to_string(),
+            issued_ms: 1_000,
+            expires_ms: 61_000,
+            token,
+            signature: Vec::new(),
+        };
+        assert!(verify_invite(&invite).is_err(), "unsigned is refused");
+
+        invite.signature = issuer.sign(&invite.signed_bytes().expect("bytes")).expect("sign");
+        verify_invite(&invite).expect("a properly signed invite verifies");
+
+        // A swapped seed (a redirected joiner) breaks the signature.
+        let mut tampered = invite.clone();
+        tampered.seed = "evil.example:4433:cc".to_string();
+        assert!(verify_invite(&tampered).is_err(), "the seed is covered by the signature");
+
+        // A swapped token breaks it too.
+        let mut tampered = invite.clone();
+        tampered.token.signature.push(9);
+        assert!(verify_invite(&tampered).is_err(), "the token is covered");
+
+        // Signing with another identity does not pass as the named host.
+        let attacker = identity(dir.path(), "attacker");
+        let mut forged = invite.clone();
+        forged.signature = IdentityIssuer::new(attacker).sign(&forged.signed_bytes().expect("bytes")).expect("sign");
+        assert!(verify_invite(&forged).is_err(), "another key does not vouch for this host");
     }
 
     #[test]
