@@ -12,7 +12,7 @@
 pub mod grant;
 pub mod identity;
 
-pub use grant::{sign_grant, verify_grant};
+pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verify_grant};
 pub use identity::Identity;
 
 use std::sync::Arc;
