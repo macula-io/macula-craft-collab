@@ -72,6 +72,7 @@ fn main() {
         let msg = Message {
             doc: "probe".into(),
             author: author.clone(),
+            epoch: 1,
             seq: 1,
             sent_at_ms: 0,
             kind: Kind::CursorMoved {

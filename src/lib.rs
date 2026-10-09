@@ -9,8 +9,10 @@
 //! `craft/collab/document_shared_v1`; the document id, author and payload are
 //! in the message itself.
 
+pub mod grant;
 pub mod identity;
 
+pub use grant::{sign_grant, verify_grant};
 pub use identity::Identity;
 
 use std::sync::Arc;
@@ -51,6 +53,18 @@ pub struct MeshTransport {
     author: String,
     out: UnboundedSender<Outbound>,
     incoming: Receiver<Message>,
+    /// Messages dropped because their claimed author was not the verified
+    /// publisher (a forged envelope author).
+    dropped_unverified: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl MeshTransport {
+    /// How many inbound messages were dropped because their envelope author
+    /// was not the publication's verified publisher.
+    pub fn dropped_unverified(&self) -> u64 {
+        self.dropped_unverified
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// What the background thread publishes.
@@ -68,6 +82,8 @@ impl MeshTransport {
         let cfg = cfg.clone();
         let author = identity.node_id().to_string();
         let key = identity.key();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dropped_in_thread = dropped.clone();
         std::thread::Builder::new()
             .name("macula-craft-collab".into())
             .spawn(move || {
@@ -81,7 +97,7 @@ impl MeshTransport {
                         return;
                     }
                 };
-                rt.block_on(run(cfg, key, in_tx, ready_tx));
+                rt.block_on(run(cfg, key, in_tx, ready_tx, dropped_in_thread));
             })
             .map_err(|e| format!("thread: {e}"))?;
         match ready_rx.recv() {
@@ -89,6 +105,7 @@ impl MeshTransport {
                 author,
                 out,
                 incoming: in_rx,
+                dropped_unverified: dropped,
             }),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("the mesh thread ended before it was ready: {e}")),
@@ -103,6 +120,7 @@ async fn run(
     key: Arc<NodeKey>,
     in_tx: Sender<Message>,
     ready: std::sync::mpsc::Sender<Result<UnboundedSender<Outbound>, String>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut opts = Opts::new(key);
     // Pubsub needs no realm trust: it is only consulted when a call resolves
@@ -130,17 +148,29 @@ async fn run(
             return;
         };
         let tx = in_tx.clone();
+        let dropped = dropped.clone();
         tokio::spawn(async move {
             while let Some(event) = sub.recv().await {
+                // The publication's verified publisher: the envelope author
+                // must be exactly this, or the message is a forgery and is
+                // dropped, never trusted.
+                let publisher: String =
+                    event.publisher.iter().map(|b| format!("{b:02x}")).collect();
                 let json = event.payload.get("json").and_then(|v| match v {
                     Value::Text(t) => Some(t.clone()),
                     _ => None,
                 });
-                if let Some(json) = json
-                    && let Ok(msg) = serde_json::from_str::<Message>(&json)
-                    && tx.send(msg).is_err()
-                {
-                    break;
+                if let Some(json) = json {
+                    match verified_message(&json, &publisher) {
+                        Some(msg) => {
+                            if tx.send(msg).is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         });
@@ -192,5 +222,49 @@ fn topic_for(kind: &Kind) -> &'static str {
         Kind::CursorMoved { .. } => TOPIC_CURSOR,
         Kind::Command { .. } => TOPIC_COMMAND,
         Kind::SnapshotRequest {} | Kind::Snapshot { .. } => TOPIC_SHARED,
+    }
+}
+
+/// A payload message, only when its envelope author is the verified
+/// publisher the transport saw; `None` for a message claiming another's id.
+pub fn verified_message(json: &str, publisher_hex: &str) -> Option<Message> {
+    let msg: Message = serde_json::from_str(json).ok()?;
+    (msg.author == publisher_hex).then_some(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg_json(author: &str) -> String {
+        serde_json::to_string(&Message {
+            doc: "demo".into(),
+            author: author.into(),
+            epoch: 7,
+            seq: 1,
+            sent_at_ms: 0,
+            kind: Kind::CursorMoved {
+                position: None,
+                name: None,
+            },
+        })
+        .expect("json")
+    }
+
+    #[test]
+    fn the_verified_publisher_authors_its_messages() {
+        let json = msg_json("aabbcc");
+        let msg = verified_message(&json, "aabbcc").expect("the publisher's own message");
+        assert_eq!(msg.author, "aabbcc");
+    }
+
+    #[test]
+    fn an_author_that_is_not_the_publisher_is_refused() {
+        let json = msg_json("aabbcc");
+        assert!(
+            verified_message(&json, "112233").is_none(),
+            "a claimed author that is not the verified publisher is a forgery"
+        );
+        assert!(verified_message("not json", "aabbcc").is_none());
     }
 }

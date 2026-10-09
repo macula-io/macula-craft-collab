@@ -73,6 +73,17 @@ impl Identity {
         self.key.clone()
     }
 
+    /// The identity's carried public key: what a peer needs to verify
+    /// signatures made as this identity (grants, invites).
+    pub fn carried_key(&self) -> Vec<u8> {
+        self.key.public_key()
+    }
+
+    /// Signs `message` as this identity.
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        self.key.sign(message).map_err(|e| format!("sign: {e:?}"))
+    }
+
     /// Loads or creates the Craft identity `slug` with display name `name`,
     /// in the profile `profile` names (`pq_pure` or `pq_hybrid`), from the OS
     /// secure store with a file fallback. A name change is persisted; a
