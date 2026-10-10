@@ -69,8 +69,9 @@ impl Identity {
         self.key.profile()
     }
 
-    /// The key itself, for a transport that links as this identity.
-    pub(crate) fn key(&self) -> Arc<NodeKey> {
+    /// The key itself, for a transport that links as this identity, or for
+    /// building a pool that signs and dials as it.
+    pub fn key(&self) -> Arc<NodeKey> {
         self.key.clone()
     }
 
@@ -87,6 +88,36 @@ impl Identity {
     }
 
     /// Signs `message` as this identity.
+    /// A realm proof v2 (macula-realm#29): this key authorises exactly this
+    /// request for this procedure in this realm, now and once. The signed
+    /// bytes are the realm's own pinned encoding — one byte off and the
+    /// realm refuses the proof.
+    pub fn device_request_proof(
+        &self,
+        realm_id: &[u8; 32],
+        procedure: &str,
+        request: &macula_rust::cbor::Value,
+        now_ms: u64,
+    ) -> Result<crate::realm::DeviceRequestProof, String> {
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|e| format!("no randomness for the proof nonce: {e}"))?;
+        let message = crate::realm::proof::device_request_message(
+            &self.carried_key(),
+            realm_id,
+            procedure,
+            now_ms,
+            &nonce,
+            request,
+        )?;
+        let signature = self.sign(&message)?;
+        Ok(crate::realm::DeviceRequestProof {
+            timestamp_ms: now_ms,
+            nonce,
+            signature,
+        })
+    }
+
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
         self.key.sign(message).map_err(|e| format!("sign: {e:?}"))
     }
@@ -243,18 +274,23 @@ fn write_meta(path: &Path, meta: &Meta) -> Result<(), String> {
 /// the platform's per-user data directory (the same convention macula uses
 /// under `macula/identity`). None where a key file cannot live (Windows).
 pub fn craft_identity_dir() -> Option<PathBuf> {
+    Some(craft_data_dir()?.join("craft").join("identity"))
+}
+
+/// The platform's per-user data directory (the same convention macula uses
+/// under `macula/identity`).
+pub(crate) fn craft_data_dir() -> Option<PathBuf> {
     let set = |var: &str| std::env::var_os(var).filter(|v| !v.is_empty());
     let home = || set("HOME").map(PathBuf::from);
-    let data = if cfg!(target_os = "macos") {
-        home()?.join("Library/Application Support")
-    } else if cfg!(target_os = "windows") {
-        set("APPDATA").map(PathBuf::from)?
-    } else {
-        set("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home().map(|h| h.join(".local/share")))?
-    };
-    Some(data.join("craft").join("identity"))
+    if cfg!(target_os = "macos") {
+        return home().map(|h| h.join("Library/Application Support"));
+    }
+    if cfg!(target_os = "windows") {
+        return set("APPDATA").map(PathBuf::from);
+    }
+    set("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".local/share")))
 }
 
 /// A storage slug: 1 to 64 lowercase ASCII letters, digits, `-` and `_`,

@@ -63,7 +63,11 @@ fn main() {
 
     // `self` makes the claim honest (the payload author IS the envelope's):
     // a relay check — the cursor must arrive under `forged_name`.
-    let victim = if victim == "self" { forger.clone() } else { victim };
+    let victim = if victim == "self" {
+        forger.clone()
+    } else {
+        victim
+    };
 
     // The claim: the payload's author is the victim, the envelope's is us.
     let msg = Message {
@@ -78,7 +82,10 @@ fn main() {
         },
     };
     match mesh.send(msg) {
-        Ok(()) => println!("forged-cursor-sent victim={} name={forged_name}", &victim[..8.min(victim.len())]),
+        Ok(()) => println!(
+            "forged-cursor-sent victim={} name={forged_name}",
+            &victim[..8.min(victim.len())]
+        ),
         Err(e) => {
             eprintln!("send failed: {e}");
             std::process::exit(1);
