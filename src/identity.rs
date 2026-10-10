@@ -46,6 +46,9 @@ pub struct Identity {
     node_id: String,
     name: String,
     slug: String,
+    /// Where this identity's `<slug>.meta` lives, when one is known: the
+    /// display name is written back there.
+    dir: Option<std::path::PathBuf>,
 }
 
 impl Identity {
@@ -57,6 +60,30 @@ impl Identity {
     /// The display name shown to peers.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether the display name is still just the storage slug (a fresh
+    /// identity nobody has named yet): the login window's cue to ask.
+    pub fn name_is_slug(&self) -> bool {
+        self.name == self.slug
+    }
+
+    /// Persists a person-chosen display name beside the key. A name is how
+    /// peers see this identity; it is written where the identity lives, so
+    /// later loads keep it (`load_or_create` with an empty name never
+    /// rewrites it).
+    pub fn set_display_name(&mut self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("a display name cannot be empty".into());
+        }
+        let dir = self.dir.as_deref().ok_or_else(|| "this identity has no metadata directory to write a name into".to_string())?;
+        let path = dir.join(format!("{}.meta", self.slug));
+        let mut meta = read_meta(&path)?;
+        meta.display_name = name.to_string();
+        write_meta(&path, &meta)?;
+        self.name = name.to_string();
+        Ok(())
     }
 
     /// The storage slug this identity was loaded under.
@@ -193,7 +220,13 @@ impl Identity {
         if let Some(path) = meta_path.as_deref() {
             write_meta(path, &meta)?;
         }
-        Ok(Identity { key: Arc::new(key), node_id: hex(&node_id), name: meta.display_name, slug: slug.to_string() })
+        Ok(Identity {
+            key: Arc::new(key),
+            node_id: hex(&node_id),
+            name: meta.display_name,
+            slug: slug.to_string(),
+            dir: dir.map(|d| d.to_path_buf()),
+        })
     }
 }
 
@@ -284,6 +317,21 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_person_chosen_name_persists_and_an_empty_load_keeps_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut id = Identity::load_or_create_at("pq_pure", "named", "", dir.path()).expect("identity");
+        assert!(id.name_is_slug(), "a fresh identity is unnamed");
+        id.set_display_name("  Ada Lovelace  ").expect("set");
+        assert_eq!(id.name(), "Ada Lovelace", "trimmed");
+        assert!(!id.name_is_slug());
+        // A later load with an empty name keeps it; a non-empty name would
+        // rewrite it, so the app never passes one for an existing identity.
+        let again = Identity::load_or_create_at("pq_pure", "named", "", dir.path()).expect("reload");
+        assert_eq!(again.name(), "Ada Lovelace");
+        assert!(id.set_display_name("   ").is_err(), "an empty name is refused");
+    }
     use super::*;
     use macula_mldsa::Zeroizing;
     use std::collections::HashMap;
