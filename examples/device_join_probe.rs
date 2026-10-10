@@ -38,7 +38,7 @@ fn main() {
         let mut opts = Opts::new(identity.key());
         // Calls resolve procedure advertisements under the realm's pinned
         // key — the same public trust anchor macula-mcp pins; pubsub needs none.
-        opts.realm_trust.insert(realm::realm_id_of(&realm_name), realm_key);
+        opts.realm_trust.insert(realm::realm_id_of(&realm_name), realm_key.clone());
         let pool = Pool::connect(vec![Seed { host, port, node_id: station }], opts).await.expect("connect");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         match realm::join_device(&pool, &identity, &realm_name, now).await {
@@ -50,6 +50,24 @@ fn main() {
                 match realm::store_credential(&cred) {
                     Ok(path) => println!("stored: {}", path.display()),
                     Err(e) => println!("store failed: {e}"),
+                }
+                // The host-side check, against the realm's own key: the live
+                // UCAN must verify for THIS node and no one else.
+                let now_s = (now / 1_000) as i64;
+                match realm::verify_membership(cred.ucan.as_deref().unwrap_or(""), &realm_key, &realm_name, &cred.node_id, now_s) {
+                    Ok(()) => println!("membership verifies at the realm's key for this node"),
+                    Err(e) => println!("membership verify failed: {e}"),
+                }
+                // The refresh leg: a device membership re-mints (a fresh
+                // proof; a citizen one would be returned untouched).
+                let before = cred.ucan_expires_ms();
+                // The realm's TTL resolves to whole seconds; wait one out so
+                // the renewal's own expiry is visibly later.
+                std::thread::sleep(Duration::from_secs(2));
+                let now = now + 2_000;
+                match realm::renew_membership(&pool, &identity, &realm_name, now).await {
+                    Ok(fresh) => println!("renewed: {} -> {:?}", before.map(|e| e.to_string()).unwrap_or_default(), fresh.ucan_expires_ms()),
+                    Err(e) => println!("renew failed: {e}"),
                 }
             }
             Err(e) => {

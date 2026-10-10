@@ -193,6 +193,78 @@ pub fn auto_join_realm() -> Option<String> {
     std::env::var("MACULA_CRAFT_AUTOJOIN_REALM").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
+/// The `can` a realm mints for a device-bound membership, and the one a
+/// person's confirmation mints.
+pub const MEMBER_DEVICE_CAN: &str = "member/device-verified";
+pub const MEMBER_CITIZEN_CAN: &str = "member/email-verified";
+
+/// How close to expiry a device-tier membership is re-minted, on connect.
+pub const RENEW_MARGIN_MS: u64 = 30 * 60 * 1_000;
+
+/// Verifies a membership UCAN the way a host does when a peer presents it:
+/// issued by the realm's own key, audience = the verified caller (exactly
+/// the presenting node), a member capability on this realm. `authorize`
+/// checks the audience itself, so a token that names anyone else is
+/// refused; the capability check pins the realm and the `can`.
+pub fn verify_membership(ucan: &str, realm_key: &[u8], realm_name: &str, node_id: &str, now_s: i64) -> Result<(), String> {
+    let caller: [u8; 32] =
+        hex::decode(node_id).map_err(|e| format!("node id: {e}"))?.try_into().map_err(|_| "node id is not 32 bytes".to_string())?;
+    let realm_with = format!("mri:realm:{realm_name}");
+    let key_id = macula_rust::node_key::key_id_of(realm_key, macula_rust::profile::Profile::PqHybrid);
+    for can in [MEMBER_DEVICE_CAN, MEMBER_CITIZEN_CAN] {
+        let policy = macula_rust::ucan::Policy::RealmMemberRequired { key_id, can: can.to_string() };
+        let ctx = macula_rust::ucan::Context {
+            caller,
+            profile: macula_rust::profile::Profile::PqHybrid,
+            now: now_s,
+            request: None,
+            proofs: std::collections::HashMap::new(),
+        };
+        if let Ok(claims) = macula_rust::ucan::authorize(ucan.as_bytes(), &policy, &ctx)
+            && capability_covers(&claims, &realm_with, can)
+        {
+            return Ok(());
+        }
+    }
+    Err("not a member of this realm, or the token is not this node's".into())
+}
+
+/// Whether any capability entry names exactly this realm and this `can`.
+fn capability_covers(claims: &serde_json::Map<String, serde_json::Value>, realm_with: &str, can: &str) -> bool {
+    let Some(caps) = claims.get("cap").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    caps.iter().any(|entry| entry.get("with").and_then(|v| v.as_str()) == Some(realm_with) && entry.get("can").and_then(|v| v.as_str()) == Some(can))
+}
+
+/// Whether this credential's membership should be re-minted. A citizen
+/// credential is a person's binding and is never silently re-minted (its
+/// renewal is the portal's session); a device credential is re-minted when
+/// its UCAN is missing or inside the renewal margin.
+pub fn needs_renewal(cred: &RealmCredential, now_ms: u64) -> bool {
+    match cred.tier {
+        Tier::Citizen => false,
+        Tier::Device => match cred.ucan_expires_ms() {
+            None => true,
+            Some(expires) => expires <= now_ms.saturating_add(RENEW_MARGIN_MS),
+        },
+    }
+}
+
+/// Re-mints a device-tier membership (a fresh proof, the realm's newest
+/// UCAN) and stores it. A citizen credential is returned untouched: a
+/// silent re-mint must never downgrade a person's binding.
+pub async fn renew_membership(pool: &Pool, identity: &Identity, realm_name: &str, now_ms: u64) -> Result<RealmCredential, String> {
+    if let Some(cred) = load_credential(identity.node_id(), realm_name)
+        && cred.tier == Tier::Citizen
+    {
+        return Ok(cred);
+    }
+    let cred = join_device(pool, identity, realm_name, now_ms).await?;
+    store_credential(&cred)?;
+    Ok(cred)
+}
+
 /// The realm's membership-minting procedure, realm-name-prefixed the way a
 /// procedure advertisement carries it.
 pub fn membership_ucan_procedure(realm_name: &str) -> String {
@@ -275,7 +347,9 @@ pub async fn ensure_auto_join(pool: &Pool, identity: &Identity, now_ms: u64) {
     let Some(realm_name) = auto_join_realm() else {
         return;
     };
-    if load_credential(identity.node_id(), &realm_name).is_some() {
+    if let Some(cred) = load_credential(identity.node_id(), &realm_name)
+        && !needs_renewal(&cred, now_ms)
+    {
         return;
     }
     match join_device(pool, identity, &realm_name, now_ms).await {
@@ -309,6 +383,70 @@ mod tests {
         let ucan = "eyJhbGciOiJFUzI1NiJ9.eyJleHAiOjE3OTIwMDAwMDAsImNhbiI6InJlYWxtL21lbWJlciJ9.sig";
         assert_eq!(ucan_expiry_ms(ucan), Some(1_792_000_000_000));
         assert_eq!(ucan_expiry_ms("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn a_membership_ucan_verifies_only_for_its_audience_realm_and_key() {
+        use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
+        use macula_rust::profile::Profile;
+        use macula_rust::ucan::{Capability, Options, create};
+
+        let realm_key = NodeKey::generate_identity(Profile::PqHybrid, PUZZLE_DIFFICULTY).expect("realm key");
+        let member = NodeKey::generate_identity(Profile::PqHybrid, PUZZLE_DIFFICULTY).expect("member key");
+        let audience = member.node_id().expect("node id");
+        let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_secs() as i64;
+        let mint = |can: &str, with: &str| {
+            let token = create(
+                &realm_key,
+                &audience,
+                &[Capability { with: with.into(), can: can.into() }],
+                &Options { exp: now_s + 3_600, ..Options::default() },
+            )
+            .expect("mint");
+            String::from_utf8(token).expect("jwt text")
+        };
+        let token = mint(MEMBER_DEVICE_CAN, "mri:realm:io.macula");
+        let node_hex = hex::encode(audience);
+        verify_membership(&token, &realm_key.public_key(), "io.macula", &node_hex, now_s).expect("its own audience and realm verify");
+        assert!(
+            verify_membership(&token, &realm_key.public_key(), "io.macula", &hex::encode([9u8; 32]), now_s).is_err(),
+            "another node's claims are refused"
+        );
+        let other_realm_key = NodeKey::generate_identity(Profile::PqHybrid, PUZZLE_DIFFICULTY).expect("other key");
+        assert!(
+            verify_membership(&token, &other_realm_key.public_key(), "io.macula", &node_hex, now_s).is_err(),
+            "another key's realm does not vouch"
+        );
+        assert!(verify_membership(&token, &realm_key.public_key(), "net.other", &node_hex, now_s).is_err(), "another realm does not match");
+        let wrong_can = mint("member/something-else", "mri:realm:io.macula");
+        assert!(verify_membership(&wrong_can, &realm_key.public_key(), "io.macula", &node_hex, now_s).is_err(), "a non-member capability is refused");
+    }
+
+    #[test]
+    fn renewal_decision_follows_tier_and_expiry() {
+        use base64::Engine as _;
+        let fake_ucan = |exp_s: u64| {
+            let payload = serde_json::json!({"exp": exp_s}).to_string();
+            format!("h.{}.s", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
+        };
+        let cred = |tier: Tier, ucan: Option<String>| RealmCredential {
+            node_id: "0011".into(),
+            realm: "io.macula".into(),
+            portal: "io.macula".into(),
+            org_identity: "mri:org:io.macula".into(),
+            account: None,
+            cert_pem: None,
+            refresh_token: String::new(),
+            joined_at_ms: 0,
+            citizen_did: None,
+            ucan,
+            tier,
+        };
+        let now = 1_000_000u64;
+        assert!(!needs_renewal(&cred(Tier::Device, Some(fake_ucan(now / 1000 + 4 * 3600))), now), "a fresh device UCAN is left alone");
+        assert!(needs_renewal(&cred(Tier::Device, Some(fake_ucan(now / 1000 + 600))), now), "inside the margin it renews");
+        assert!(needs_renewal(&cred(Tier::Device, None), now), "a device credential without a UCAN renews");
+        assert!(!needs_renewal(&cred(Tier::Citizen, Some(fake_ucan(now / 1000 + 60))), now), "a person's binding is never silently re-minted");
     }
 
     #[test]
