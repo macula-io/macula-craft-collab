@@ -125,6 +125,14 @@ impl Identity {
         }
     }
 
+    /// [`Identity::load_or_create`] rooted at `dir`, file backend only: for
+    /// tests and embedders that keep the keys elsewhere (the app's real
+    /// startup goes through `load_or_create`, secure store first).
+    pub fn load_or_create_at(profile: &str, slug: &str, name: &str, dir: &Path) -> Result<Identity, String> {
+        let profile = Profile::parse(profile).map_err(|e| format!("profile: {e}"))?;
+        Self::load_or_create_with(profile, slug, name, None, Some(dir))
+    }
+
     /// [`Identity::load_or_create`] against an explicit store and directory,
     /// for tests and embedders. The first load picks the backend that works
     /// and records it in `<slug>.meta`; later loads use only that backend, so
