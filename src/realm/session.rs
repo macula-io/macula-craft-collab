@@ -61,21 +61,11 @@ pub fn join_request_body(identity: &Identity) -> Json {
 }
 
 /// Creates a join session: POSTs the proof-signed body and returns the link.
-pub fn create_session(
-    realm_name: &str,
-    base_url: &str,
-    identity: &Identity,
-    now_ms: u64,
-) -> Result<CreatedSession, String> {
+pub fn create_session(realm_name: &str, base_url: &str, identity: &Identity, now_ms: u64) -> Result<CreatedSession, String> {
     let body = join_request_body(identity);
     let request = proof::canonical_json(&body)?;
     let proof = identity
-        .device_request_proof(
-            &crate::realm::realm_id_of(realm_name),
-            JOIN_SESSION_PROCEDURE,
-            &request,
-            now_ms,
-        )
+        .device_request_proof(&crate::realm::realm_id_of(realm_name), JOIN_SESSION_PROCEDURE, &request, now_ms)
         .map_err(|e| format!("proof: {e}"))?;
     post_join_session(base_url, &with_proof(body, &proof))
 }
@@ -101,29 +91,15 @@ pub fn parse_created(status: i32, body: &str) -> Result<CreatedSession, String> 
     if (200..300).contains(&status)
         && let (Some(session_id), Some(join_url)) = (field("session_id"), field("join_url"))
     {
-        return Ok(CreatedSession {
-            session_id,
-            join_url,
-            expires_at: field("expires_at").unwrap_or_default(),
-        });
+        return Ok(CreatedSession { session_id, join_url, expires_at: field("expires_at").unwrap_or_default() });
     }
-    Err(format!(
-        "realm refused to create a join session (HTTP {status}): {body}"
-    ))
+    Err(format!("realm refused to create a join session (HTTP {status}): {body}"))
 }
 
 /// Polls a session: pending, confirmed, expired, or an error.
 pub fn poll_session(base_url: &str, session_id: &str) -> Result<SessionStatus, String> {
-    let url = format!(
-        "{}/api/v1/join/sessions/{}",
-        base_url.trim_end_matches('/'),
-        urlencode(session_id)
-    );
-    let res = minreq::get(&url)
-        .with_header("accept", "application/json")
-        .with_timeout(10)
-        .send()
-        .map_err(|e| format!("{url}: {e}"))?;
+    let url = format!("{}/api/v1/join/sessions/{}", base_url.trim_end_matches('/'), urlencode(session_id));
+    let res = minreq::get(&url).with_header("accept", "application/json").with_timeout(10).send().map_err(|e| format!("{url}: {e}"))?;
     let text = res.as_str().map_err(|e| format!("{url}: {e}"))?;
     Ok(parse_session_status(res.status_code, text))
 }
@@ -136,14 +112,11 @@ pub fn parse_session_status(status: i32, body: &str) -> SessionStatus {
         return SessionStatus::Expired;
     }
     if status == 200 && field("status").as_deref() == Some("pending") {
-        return SessionStatus::Pending {
-            expires_at: field("expires_at").unwrap_or_default(),
-        };
+        return SessionStatus::Pending { expires_at: field("expires_at").unwrap_or_default() };
     }
     if status == 200
         && field("status").as_deref() == Some("confirmed")
-        && let (Some(refresh_token), Some(org_identity)) =
-            (field("refresh_token"), field("org_identity"))
+        && let (Some(refresh_token), Some(org_identity)) = (field("refresh_token"), field("org_identity"))
     {
         return SessionStatus::Confirmed(ConfirmedSession {
             refresh_token,
@@ -193,9 +166,7 @@ fn with_proof(body: Json, proof: &DeviceRequestProof) -> Json {
 fn urlencode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (b as char).to_string()
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
             other => format!("%{other:02X}"),
         })
         .collect()
@@ -212,8 +183,7 @@ mod tests {
     use super::*;
 
     fn identity(dir: &std::path::Path) -> Identity {
-        Identity::load_or_create_with(Profile::PqHybrid, "joiner", "Joiner", None, Some(dir))
-            .expect("identity")
+        Identity::load_or_create_with(Profile::PqHybrid, "joiner", "Joiner", None, Some(dir)).expect("identity")
     }
 
     /// A mock realm: verifies the posted proof exactly as the realm does
@@ -261,11 +231,7 @@ mod tests {
                 let headers = String::from_utf8_lossy(&buf[..headers_end]).to_string();
                 let length = headers
                     .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                    })
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
                     .unwrap_or(0);
                 if buf.len() >= headers_end + 4 + length {
                     break;
@@ -287,66 +253,36 @@ mod tests {
         hay.windows(needle.len()).position(|w| w == needle)
     }
 
-    fn handle(
-        request: &Request,
-        realm_id: &[u8; 32],
-        public_key: &[u8],
-        seen: &Arc<Mutex<Vec<String>>>,
-    ) -> (String, String) {
+    fn handle(request: &Request, realm_id: &[u8; 32], public_key: &[u8], seen: &Arc<Mutex<Vec<String>>>) -> (String, String) {
         if request.method == "POST" && request.path == "/api/v1/join/sessions" {
             let Ok(body) = serde_json::from_str::<Json>(&request.body) else {
                 return ("400 Bad Request".into(), r#"{"error":"bad json"}"#.into());
             };
             let Some(proof_json) = body.get("proof") else {
-                return (
-                    "400 Bad Request".into(),
-                    r#"{"error":"missing_proof"}"#.into(),
-                );
+                return ("400 Bad Request".into(), r#"{"error":"missing_proof"}"#.into());
             };
             let mut request_body = body.clone();
             if let Some(map) = request_body.as_object_mut() {
                 map.remove("proof");
             }
             let Ok(message_request) = proof::canonical_json(&request_body) else {
-                return (
-                    "400 Bad Request".into(),
-                    r#"{"error":"bad_request"}"#.into(),
-                );
+                return ("400 Bad Request".into(), r#"{"error":"bad_request"}"#.into());
             };
             let Ok(proof) = proof_from_json(proof_json) else {
                 return ("400 Bad Request".into(), r#"{"error":"bad_proof"}"#.into());
             };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            match proof::verify_device_request(
-                public_key,
-                realm_id,
-                JOIN_SESSION_PROCEDURE,
-                &message_request,
-                &proof,
-                now,
-            ) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+            match proof::verify_device_request(public_key, realm_id, JOIN_SESSION_PROCEDURE, &message_request, &proof, now) {
                 Ok(()) => {
-                    seen.lock()
-                        .map(|mut s| s.push("create-verified".into()))
-                        .ok();
+                    seen.lock().map(|mut s| s.push("create-verified".into())).ok();
                     ("201 Created".into(), r#"{"session_id":"s-1","join_url":"https://realm.example/join/s-1","expires_at":"+10m"}"#.into())
                 }
-                Err(reason) => (
-                    "400 Bad Request".into(),
-                    format!(r#"{{"error":"{reason}"}}"#),
-                ),
+                Err(reason) => ("400 Bad Request".into(), format!(r#"{{"error":"{reason}"}}"#)),
             }
         } else if request.method == "GET" && request.path.starts_with("/api/v1/join/sessions/") {
             let count = seen.lock().map(|mut s| {
                 let pending = s.iter().filter(|m| m.as_str() == "pending").count();
-                s.push(if pending == 0 {
-                    "pending".into()
-                } else {
-                    "confirmed".into()
-                });
+                s.push(if pending == 0 { "pending".into() } else { "confirmed".into() });
                 pending
             });
             match count {
@@ -362,24 +298,14 @@ mod tests {
     }
 
     fn proof_from_json(value: &Json) -> Result<DeviceRequestProof, String> {
-        let nonce: [u8; 16] =
-            hex::decode(value.get("nonce").and_then(Json::as_str).ok_or("nonce")?)
-                .map_err(|e| e.to_string())?
-                .try_into()
-                .map_err(|_| "nonce size".to_string())?;
+        let nonce: [u8; 16] = hex::decode(value.get("nonce").and_then(Json::as_str).ok_or("nonce")?)
+            .map_err(|e| e.to_string())?
+            .try_into()
+            .map_err(|_| "nonce size".to_string())?;
         Ok(DeviceRequestProof {
-            timestamp_ms: value
-                .get("timestamp")
-                .and_then(Json::as_u64)
-                .ok_or("timestamp")?,
+            timestamp_ms: value.get("timestamp").and_then(Json::as_u64).ok_or("timestamp")?,
             nonce,
-            signature: hex::decode(
-                value
-                    .get("signature")
-                    .and_then(Json::as_str)
-                    .ok_or("signature")?,
-            )
-            .map_err(|e| e.to_string())?,
+            signature: hex::decode(value.get("signature").and_then(Json::as_str).ok_or("signature")?).map_err(|e| e.to_string())?,
         })
     }
 
@@ -388,24 +314,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let id = identity(dir.path());
         let (base, seen) = mock_realm("io.macula", id.carried_key());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
 
         // The mock verifies the proof exactly as the realm does: a request
         // whose signed bytes it cannot rebuild is refused, so this passing
         // is the red-first check of the whole citizen path.
         let created = create_session("io.macula", &base, &id, now).expect("create");
         assert_eq!(created.session_id, "s-1");
-        assert!(
-            created.join_url.starts_with("https://realm."),
-            "a link the person can open"
-        );
-        assert_eq!(
-            seen.lock().expect("lock").first().map(String::as_str),
-            Some("create-verified")
-        );
+        assert!(created.join_url.starts_with("https://realm."), "a link the person can open");
+        assert_eq!(seen.lock().expect("lock").first().map(String::as_str), Some("create-verified"));
 
         match poll_session(&base, &created.session_id).expect("poll") {
             SessionStatus::Pending { .. } => {}
@@ -421,10 +338,7 @@ mod tests {
         assert_eq!(cred.ucan_expires_ms(), Some(1_792_000_000_000));
         let path = crate::realm::store_credential_in(dir.path(), &cred).expect("store");
         assert!(path.exists());
-        assert_eq!(
-            crate::realm::load_credential_in(dir.path(), id.node_id(), "io.macula"),
-            Some(cred)
-        );
+        assert_eq!(crate::realm::load_credential_in(dir.path(), id.node_id(), "io.macula"), Some(cred));
     }
 
     #[test]
@@ -436,20 +350,10 @@ mod tests {
         let id = identity(dir.path());
         let body = join_request_body(&id);
         let signed = proof::canonical_json(&body).expect("canonical");
-        let proof = id
-            .device_request_proof(
-                &crate::realm::realm_id_of("io.macula"),
-                JOIN_SESSION_PROCEDURE,
-                &signed,
-                1_000,
-            )
-            .expect("proof");
+        let proof = id.device_request_proof(&crate::realm::realm_id_of("io.macula"), JOIN_SESSION_PROCEDURE, &signed, 1_000).expect("proof");
         let mut tampered = signed.clone();
         if let macula_rust::cbor::Value::Map(pairs) = &mut tampered {
-            pairs[0] = (
-                macula_rust::cbor::Value::text("public_key"),
-                macula_rust::cbor::Value::text("someone-elses-key"),
-            );
+            pairs[0] = (macula_rust::cbor::Value::text("public_key"), macula_rust::cbor::Value::text("someone-elses-key"));
         }
         assert!(
             proof::verify_device_request(
@@ -464,36 +368,17 @@ mod tests {
             "a body edit breaks the proof"
         );
         assert!(
-            proof::verify_device_request(
-                &id.carried_key(),
-                &crate::realm::realm_id_of("io.macula"),
-                JOIN_SESSION_PROCEDURE,
-                &signed,
-                &proof,
-                1_000
-            )
-            .is_ok()
+            proof::verify_device_request(&id.carried_key(), &crate::realm::realm_id_of("io.macula"), JOIN_SESSION_PROCEDURE, &signed, &proof, 1_000)
+                .is_ok()
         );
     }
 
     #[test]
     fn session_replies_shape_like_the_realm_documents() {
         assert_eq!(parse_session_status(410, "{}"), SessionStatus::Expired);
-        assert_eq!(
-            parse_session_status(200, r#"{"status":"pending","expires_at":"x"}"#),
-            SessionStatus::Pending {
-                expires_at: "x".into()
-            }
-        );
-        assert!(matches!(
-            parse_session_status(500, "{}"),
-            SessionStatus::Error(_)
-        ));
+        assert_eq!(parse_session_status(200, r#"{"status":"pending","expires_at":"x"}"#), SessionStatus::Pending { expires_at: "x".into() });
+        assert!(matches!(parse_session_status(500, "{}"), SessionStatus::Error(_)));
         assert!(parse_created(403, r#"{"error":"no"}"#).is_err());
-        assert_eq!(
-            realm_base_url("io.macula"),
-            "https://realm.macula.io",
-            "the realm's own URL formula"
-        );
+        assert_eq!(realm_base_url("io.macula"), "https://realm.macula.io", "the realm's own URL formula");
     }
 }

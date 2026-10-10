@@ -14,9 +14,7 @@ pub mod identity;
 pub mod issuer;
 pub mod realm;
 
-pub use grant::{
-    KeyGrantVerifier, sign_grant, verified_access, verified_access_from, verify_grant,
-};
+pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verified_access_from, verify_grant};
 pub use identity::Identity;
 pub use issuer::{IdentityIssuer, verify_invite};
 pub use realm::{RealmCredential, Tier};
@@ -75,8 +73,7 @@ impl MeshTransport {
     /// How many inbound messages were dropped because their envelope author
     /// was not the publication's verified publisher.
     pub fn dropped_unverified(&self) -> u64 {
-        self.dropped_unverified
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.dropped_unverified.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -107,10 +104,7 @@ impl MeshTransport {
         std::thread::Builder::new()
             .name("macula-craft-collab".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                {
+                let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                     Ok(rt) => rt,
                     Err(e) => {
                         let _ = ready_tx.send(Err(format!("runtime: {e}")));
@@ -121,12 +115,7 @@ impl MeshTransport {
             })
             .map_err(|e| format!("thread: {e}"))?;
         match ready_rx.recv() {
-            Ok(Ok(out)) => Ok(MeshTransport {
-                author,
-                out,
-                incoming: in_rx,
-                dropped_unverified: dropped,
-            }),
+            Ok(Ok(out)) => Ok(MeshTransport { author, out, incoming: in_rx, dropped_unverified: dropped }),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("the mesh thread ended before it was ready: {e}")),
         }
@@ -141,13 +130,9 @@ impl MeshTransport {
     pub fn join_realm_device(&self, realm_name: &str) -> Result<RealmCredential, String> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.out
-            .send(Outbound::DeviceJoin {
-                realm_name: realm_name.to_string(),
-                reply: tx,
-            })
+            .send(Outbound::DeviceJoin { realm_name: realm_name.to_string(), reply: tx })
             .map_err(|_| "the mesh transport is closed".to_string())?;
-        rx.recv()
-            .map_err(|_| "the mesh transport ended before the join answered".to_string())?
+        rx.recv().map_err(|_| "the mesh transport ended before the join answered".to_string())?
     }
 }
 
@@ -167,11 +152,7 @@ async fn run(
     if !cfg.realm_key.is_empty() {
         opts.realm_trust.insert(cfg.realm_id, cfg.realm_key.clone());
     }
-    let seeds = vec![Seed {
-        host: cfg.host.clone(),
-        port: cfg.port,
-        node_id: cfg.station_node_id,
-    }];
+    let seeds = vec![Seed { host: cfg.host.clone(), port: cfg.port, node_id: cfg.station_node_id }];
     let pool = match Pool::connect(seeds, opts).await {
         Ok(pool) => pool,
         Err(e) => {
@@ -185,32 +166,19 @@ async fn run(
     // (a call can only be resolved under it). Non-fatal by design.
     if cfg.realm_key.is_empty() {
         if realm::auto_join_realm().is_some() {
-            eprintln!(
-                "realm auto-join: no realm key pinned in this config; skipping (calls need the trust anchor)"
-            );
+            eprintln!("realm auto-join: no realm key pinned in this config; skipping (calls need the trust anchor)");
         }
     } else {
         let pool_for_join = pool.clone();
         let identity_for_join = identity.clone();
         tokio::spawn(async move {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
             realm::ensure_auto_join(&pool_for_join, &identity_for_join, now).await;
         });
     }
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
-    for topic in [
-        TOPIC_TEXT,
-        TOPIC_CURSOR,
-        TOPIC_SHARED,
-        TOPIC_COMMAND,
-        TOPIC_JOIN,
-        TOPIC_GRANT,
-        TOPIC_REVOKE,
-    ] {
+    for topic in [TOPIC_TEXT, TOPIC_CURSOR, TOPIC_SHARED, TOPIC_COMMAND, TOPIC_JOIN, TOPIC_GRANT, TOPIC_REVOKE] {
         let Ok(mut sub) = pool.subscribe(&cfg.realm_id, topic).await else {
             let _ = ready.send(Err(format!("subscribe {topic}")));
             return;
@@ -222,8 +190,7 @@ async fn run(
                 // The publication's verified publisher: the envelope author
                 // must be exactly this, or the message is a forgery and is
                 // dropped, never trusted.
-                let publisher: String =
-                    event.publisher.iter().map(|b| format!("{b:02x}")).collect();
+                let publisher: String = event.publisher.iter().map(|b| format!("{b:02x}")).collect();
                 let json = event.payload.get("json").and_then(|v| match v {
                     Value::Text(t) => Some(t.clone()),
                     _ => None,
@@ -250,10 +217,7 @@ async fn run(
     while let Some(out) = out_rx.recv().await {
         match out {
             Outbound::DeviceJoin { realm_name, reply } => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 let outcome = match realm::join_device(&pool, &identity, &realm_name, now).await {
                     Ok(cred) => match realm::store_credential(&cred) {
                         Ok(_) => Ok(cred),
@@ -265,14 +229,7 @@ async fn run(
             }
             Outbound::Publish(topic, json) => {
                 let payload = Value::Map(vec![(Value::text("json"), Value::text(json))]);
-                let _ = pool
-                    .publish(Publication {
-                        realm,
-                        topic: topic.to_string(),
-                        payload,
-                        ttl_ms: None,
-                    })
-                    .await;
+                let _ = pool.publish(Publication { realm, topic: topic.to_string(), payload, ttl_ms: None }).await;
             }
         }
     }
@@ -287,9 +244,7 @@ impl Transport for MeshTransport {
     fn send(&mut self, msg: Message) -> Result<(), String> {
         let topic = topic_for(&msg.kind);
         let json = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-        self.out
-            .send(Outbound::Publish(topic, json))
-            .map_err(|_| "the mesh link has ended".to_string())
+        self.out.send(Outbound::Publish(topic, json)).map_err(|_| "the mesh link has ended".to_string())
     }
 
     fn poll(&mut self) -> Vec<Message> {
@@ -328,10 +283,7 @@ mod tests {
             epoch: 7,
             seq: 1,
             sent_at_ms: 0,
-            kind: Kind::CursorMoved {
-                position: None,
-                name: None,
-            },
+            kind: Kind::CursorMoved { position: None, name: None },
         })
         .expect("json")
     }
@@ -346,10 +298,7 @@ mod tests {
     #[test]
     fn an_author_that_is_not_the_publisher_is_refused() {
         let json = msg_json("aabbcc");
-        assert!(
-            verified_message(&json, "112233").is_none(),
-            "a claimed author that is not the verified publisher is a forgery"
-        );
+        assert!(verified_message(&json, "112233").is_none(), "a claimed author that is not the verified publisher is a forgery");
         assert!(verified_message("not json", "aabbcc").is_none());
     }
 }

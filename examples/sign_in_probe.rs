@@ -11,23 +11,11 @@ fn main() {
         eprintln!("usage: sign_in_probe <realm_name> [slug]");
         std::process::exit(2);
     });
-    let slug = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| "sign-in-probe".into());
-    let dir = macula_craft_collab::identity::craft_identity_dir()
-        .unwrap_or_else(|| std::env::temp_dir().join("craft-sign-in-probe"));
-    let identity = Identity::load_or_create_with(
-        macula_rust::profile::Profile::PqHybrid,
-        &slug,
-        "Sign In Probe",
-        None,
-        Some(&dir),
-    )
-    .expect("identity");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let slug = std::env::args().nth(2).unwrap_or_else(|| "sign-in-probe".into());
+    let dir = macula_craft_collab::identity::craft_identity_dir().unwrap_or_else(|| std::env::temp_dir().join("craft-sign-in-probe"));
+    let identity =
+        Identity::load_or_create_with(macula_rust::profile::Profile::PqHybrid, &slug, "Sign In Probe", None, Some(&dir)).expect("identity");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     let base = realm::session::realm_base_url(&realm_name);
     println!("portal: {base}");
     match realm::session::create_session(&realm_name, &base, &identity, now) {

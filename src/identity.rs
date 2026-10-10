@@ -100,22 +100,10 @@ impl Identity {
         now_ms: u64,
     ) -> Result<crate::realm::DeviceRequestProof, String> {
         let mut nonce = [0u8; 16];
-        getrandom::getrandom(&mut nonce)
-            .map_err(|e| format!("no randomness for the proof nonce: {e}"))?;
-        let message = crate::realm::proof::device_request_message(
-            &self.carried_key(),
-            realm_id,
-            procedure,
-            now_ms,
-            &nonce,
-            request,
-        )?;
+        getrandom::getrandom(&mut nonce).map_err(|e| format!("no randomness for the proof nonce: {e}"))?;
+        let message = crate::realm::proof::device_request_message(&self.carried_key(), realm_id, procedure, now_ms, &nonce, request)?;
         let signature = self.sign(&message)?;
-        Ok(crate::realm::DeviceRequestProof {
-            timestamp_ms: now_ms,
-            nonce,
-            signature,
-        })
+        Ok(crate::realm::DeviceRequestProof { timestamp_ms: now_ms, nonce, signature })
     }
 
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
@@ -130,9 +118,7 @@ impl Identity {
         let profile = Profile::parse(profile).map_err(|e| format!("profile: {e}"))?;
         let dir = craft_identity_dir();
         match KeyringStore::new(IDENTITY_SERVICE, slug) {
-            Ok(store) => {
-                Self::load_or_create_with(profile, slug, name, Some(&store), dir.as_deref())
-            }
+            Ok(store) => Self::load_or_create_with(profile, slug, name, Some(&store), dir.as_deref()),
             // No store at all: the file fallback must be usable.
             Err(e) => Self::load_or_create_with(profile, slug, name, None, dir.as_deref())
                 .map_err(|fallback| format!("secure store unavailable ({e}); {fallback}")),
@@ -159,10 +145,7 @@ impl Identity {
 
         let key = match meta.backend {
             Some(Backend::Keyring) => {
-                let store = store.ok_or_else(|| {
-                    "this identity is kept in the secure store, which is unavailable here"
-                        .to_string()
-                })?;
+                let store = store.ok_or_else(|| "this identity is kept in the secure store, which is unavailable here".to_string())?;
                 keyring_identity(store, profile).map_err(|pick| match pick {
                     StorePick::Unavailable(why) => why,
                     StorePick::Refused(why) => why,
@@ -202,12 +185,7 @@ impl Identity {
         if let Some(path) = meta_path.as_deref() {
             write_meta(path, &meta)?;
         }
-        Ok(Identity {
-            key: Arc::new(key),
-            node_id: hex(&node_id),
-            name: meta.display_name,
-            slug: slug.to_string(),
-        })
+        Ok(Identity { key: Arc::new(key), node_id: hex(&node_id), name: meta.display_name, slug: slug.to_string() })
     }
 }
 
@@ -225,33 +203,22 @@ fn keyring_identity(store: &dyn KeyStore, profile: Profile) -> Result<NodeKey, S
     match NodeKey::load_from_keystore(store, Purpose::Identity, profile) {
         Ok(key) => Ok(key),
         Err(KeyFileError::KeyStore(KeyStoreError::NotFound)) => {
-            let key = NodeKey::generate_identity(profile, PUZZLE_DIFFICULTY)
-                .map_err(|e| StorePick::Unavailable(format!("key: {e:?}")))?;
+            let key = NodeKey::generate_identity(profile, PUZZLE_DIFFICULTY).map_err(|e| StorePick::Unavailable(format!("key: {e:?}")))?;
             match key.save_to_keystore(store) {
                 Ok(()) => Ok(key),
-                Err(e) => Err(StorePick::Unavailable(format!(
-                    "the secure store refused to save: {e}"
-                ))),
+                Err(e) => Err(StorePick::Unavailable(format!("the secure store refused to save: {e}"))),
             }
         }
-        Err(KeyFileError::KeyStore(KeyStoreError::Backend(e))) => {
-            Err(StorePick::Unavailable(e.to_string()))
-        }
-        Err(e) => Err(StorePick::Refused(format!(
-            "the stored key does not load: {e}"
-        ))),
+        Err(KeyFileError::KeyStore(KeyStoreError::Backend(e))) => Err(StorePick::Unavailable(e.to_string())),
+        Err(e) => Err(StorePick::Refused(format!("the stored key does not load: {e}"))),
     }
 }
 
 /// The key file in the Craft identity directory (macula-rust's key-file
 /// layout, generated with the admission puzzle solved when absent).
 fn file_identity(dir: Option<&Path>, slug: &str, profile: Profile) -> Result<NodeKey, String> {
-    let dir = dir.ok_or_else(|| {
-        "the secure store is unavailable and there is no identity directory for the file fallback".to_string()
-    })?;
-    NodeKey::stored_identity(dir, slug, profile)
-        .map(|(key, _)| key)
-        .map_err(|e| format!("identity file: {e}"))
+    let dir = dir.ok_or_else(|| "the secure store is unavailable and there is no identity directory for the file fallback".to_string())?;
+    NodeKey::stored_identity(dir, slug, profile).map(|(key, _)| key).map_err(|e| format!("identity file: {e}"))
 }
 
 fn read_meta(path: &Path) -> Result<Meta, String> {
@@ -288,9 +255,7 @@ pub(crate) fn craft_data_dir() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
         return set("APPDATA").map(PathBuf::from);
     }
-    set("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home().map(|h| h.join(".local/share")))
+    set("XDG_DATA_HOME").map(PathBuf::from).or_else(|| home().map(|h| h.join(".local/share")))
 }
 
 /// A storage slug: 1 to 64 lowercase ASCII letters, digits, `-` and `_`,
@@ -298,19 +263,11 @@ pub(crate) fn craft_data_dir() -> Option<PathBuf> {
 fn validate_slug(slug: &str) -> Result<(), String> {
     let ok = {
         let b = slug.as_bytes();
-        b.first()
-            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        b.first().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
             && b.len() <= 64
-            && b.iter()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
+            && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
     };
-    if ok {
-        Ok(())
-    } else {
-        Err(format!(
-            "bad identity slug {slug:?}: 1-64 lowercase letters, digits, - or _"
-        ))
-    }
+    if ok { Ok(()) } else { Err(format!("bad identity slug {slug:?}: 1-64 lowercase letters, digits, - or _")) }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -337,10 +294,7 @@ mod tests {
             MemStore::default()
         }
         fn broken() -> MemStore {
-            MemStore {
-                keys: Mutex::new(HashMap::new()),
-                broken: true,
-            }
+            MemStore { keys: Mutex::new(HashMap::new()), broken: true }
         }
         fn backend_error() -> KeyStoreError {
             KeyStoreError::Backend(keyring::Error::NoEntry)
@@ -383,69 +337,30 @@ mod tests {
     fn an_identity_persists_in_the_store() {
         let store = MemStore::working();
         let dir = tmp();
-        let a = Identity::load_or_create_with(
-            Profile::PqPure,
-            "alice",
-            "Alice",
-            Some(&store),
-            Some(dir.path()),
-        )
-        .expect("first");
-        let b = Identity::load_or_create_with(
-            Profile::PqPure,
-            "alice",
-            "Alice",
-            Some(&store),
-            Some(dir.path()),
-        )
-        .expect("second");
+        let a = Identity::load_or_create_with(Profile::PqPure, "alice", "Alice", Some(&store), Some(dir.path())).expect("first");
+        let b = Identity::load_or_create_with(Profile::PqPure, "alice", "Alice", Some(&store), Some(dir.path())).expect("second");
         assert_eq!(a.node_id(), b.node_id(), "the same identity, not a new key");
         assert_eq!(b.name(), "Alice");
         // A fresh store handle over the same backing store behaves the same.
-        let c = Identity::load_or_create_with(
-            Profile::PqPure,
-            "alice",
-            "Alice",
-            Some(&MemStore::working()),
-            Some(dir.path()),
-        );
-        assert!(
-            c.is_ok(),
-            "an empty store with an existing meta must not mint a second identity"
-        );
+        let c = Identity::load_or_create_with(Profile::PqPure, "alice", "Alice", Some(&MemStore::working()), Some(dir.path()));
+        assert!(c.is_ok(), "an empty store with an existing meta must not mint a second identity");
     }
 
     #[test]
     fn the_file_fallback_persists_too() {
         let dir = tmp();
-        let a =
-            Identity::load_or_create_with(Profile::PqPure, "bob", "Bob", None, Some(dir.path()))
-                .expect("first");
-        let b =
-            Identity::load_or_create_with(Profile::PqPure, "bob", "Bob", None, Some(dir.path()))
-                .expect("second");
+        let a = Identity::load_or_create_with(Profile::PqPure, "bob", "Bob", None, Some(dir.path())).expect("first");
+        let b = Identity::load_or_create_with(Profile::PqPure, "bob", "Bob", None, Some(dir.path())).expect("second");
         assert_eq!(a.node_id(), b.node_id(), "file-backed identity is stable");
-        assert!(
-            dir.path().join("bob.pq_pure.key").exists(),
-            "the key file is where macula's layout says"
-        );
+        assert!(dir.path().join("bob.pq_pure.key").exists(), "the key file is where macula's layout says");
         assert!(a.node_id().len() == 64);
     }
 
     #[test]
     fn different_slugs_are_different_identities() {
         let dir = tmp();
-        let a = Identity::load_or_create_with(
-            Profile::PqPure,
-            "alice",
-            "Alice",
-            None,
-            Some(dir.path()),
-        )
-        .expect("alice");
-        let b =
-            Identity::load_or_create_with(Profile::PqPure, "bob", "Bob", None, Some(dir.path()))
-                .expect("bob");
+        let a = Identity::load_or_create_with(Profile::PqPure, "alice", "Alice", None, Some(dir.path())).expect("alice");
+        let b = Identity::load_or_create_with(Profile::PqPure, "bob", "Bob", None, Some(dir.path())).expect("bob");
         assert_ne!(a.node_id(), b.node_id());
     }
 
@@ -453,92 +368,34 @@ mod tests {
     fn a_broken_store_falls_back_to_file_and_stays_there() {
         let dir = tmp();
         let store = MemStore::broken();
-        let a = Identity::load_or_create_with(
-            Profile::PqPure,
-            "carol",
-            "Carol",
-            Some(&store),
-            Some(dir.path()),
-        )
-        .expect("fallback");
-        let b = Identity::load_or_create_with(
-            Profile::PqPure,
-            "carol",
-            "Carol",
-            Some(&store),
-            Some(dir.path()),
-        )
-        .expect("again");
-        assert_eq!(
-            a.node_id(),
-            b.node_id(),
-            "the fallback identity is stable, not reminted per call"
-        );
+        let a = Identity::load_or_create_with(Profile::PqPure, "carol", "Carol", Some(&store), Some(dir.path())).expect("fallback");
+        let b = Identity::load_or_create_with(Profile::PqPure, "carol", "Carol", Some(&store), Some(dir.path())).expect("again");
+        assert_eq!(a.node_id(), b.node_id(), "the fallback identity is stable, not reminted per call");
     }
 
     #[test]
     fn an_empty_store_with_a_file_identity_does_not_mint_a_second() {
         let dir = tmp();
-        let file_first =
-            Identity::load_or_create_with(Profile::PqPure, "dave", "Dave", None, Some(dir.path()))
-                .expect("file");
-        let later = Identity::load_or_create_with(
-            Profile::PqPure,
-            "dave",
-            "Dave",
-            Some(&MemStore::working()),
-            Some(dir.path()),
-        )
-        .expect("store later");
-        assert_eq!(
-            file_first.node_id(),
-            later.node_id(),
-            "the recorded backend decides, not what happens to be available"
-        );
+        let file_first = Identity::load_or_create_with(Profile::PqPure, "dave", "Dave", None, Some(dir.path())).expect("file");
+        let later =
+            Identity::load_or_create_with(Profile::PqPure, "dave", "Dave", Some(&MemStore::working()), Some(dir.path())).expect("store later");
+        assert_eq!(file_first.node_id(), later.node_id(), "the recorded backend decides, not what happens to be available");
     }
 
     #[test]
     fn a_bad_slug_is_refused() {
         let dir = tmp();
-        assert!(
-            Identity::load_or_create_with(
-                Profile::PqPure,
-                "Alice Smith",
-                "Alice",
-                None,
-                Some(dir.path())
-            )
-            .is_err()
-        );
-        assert!(
-            Identity::load_or_create_with(Profile::PqPure, "alice", "Alice", None, None).is_err(),
-            "no store and no dir is an error"
-        );
+        assert!(Identity::load_or_create_with(Profile::PqPure, "Alice Smith", "Alice", None, Some(dir.path())).is_err());
+        assert!(Identity::load_or_create_with(Profile::PqPure, "alice", "Alice", None, None).is_err(), "no store and no dir is an error");
     }
 
     #[test]
     fn a_name_change_persists() {
         let dir = tmp();
-        let _ =
-            Identity::load_or_create_with(Profile::PqPure, "erin", "Erin", None, Some(dir.path()))
-                .expect("first");
-        let renamed = Identity::load_or_create_with(
-            Profile::PqPure,
-            "erin",
-            "Erin B.",
-            None,
-            Some(dir.path()),
-        )
-        .expect("rename");
+        let _ = Identity::load_or_create_with(Profile::PqPure, "erin", "Erin", None, Some(dir.path())).expect("first");
+        let renamed = Identity::load_or_create_with(Profile::PqPure, "erin", "Erin B.", None, Some(dir.path())).expect("rename");
         assert_eq!(renamed.name(), "Erin B.");
-        let again = Identity::load_or_create_with(
-            Profile::PqPure,
-            "erin",
-            "Erin B.",
-            None,
-            Some(dir.path()),
-        )
-        .expect("again");
+        let again = Identity::load_or_create_with(Profile::PqPure, "erin", "Erin B.", None, Some(dir.path())).expect("again");
         assert_eq!(again.name(), "Erin B.", "the name is stored beside the key");
     }
 }

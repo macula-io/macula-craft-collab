@@ -10,9 +10,7 @@
 
 use std::sync::Arc;
 
-use craft_collab::{
-    Access, GRANT_VERSION, Grant, GrantVerifier, Revocation, SignedGrant, SignedRevocation,
-};
+use craft_collab::{Access, GRANT_VERSION, Grant, GrantVerifier, Revocation, SignedGrant, SignedRevocation};
 use macula_rust::node_key::node_id_of;
 use macula_rust::profile::Profile;
 
@@ -22,22 +20,14 @@ use crate::identity::Identity;
 pub fn sign_grant(identity: &Identity, grant: &Grant) -> Result<SignedGrant, String> {
     let bytes = grant.signed_bytes()?;
     let signature = identity.sign(&bytes)?;
-    Ok(SignedGrant {
-        grant: grant.clone(),
-        signature,
-    })
+    Ok(SignedGrant { grant: grant.clone(), signature })
 }
 
 /// Verifies `signed` against `host_carried_key`, at `now_ms`: the signature
 /// must verify under that key, the key must derive the grant's host id, the
 /// version must be current, and the grant must be live. The verifier is the
 /// caller holding the host's carried key (from the invite or the document).
-pub fn verify_grant(
-    signed: &SignedGrant,
-    host_carried_key: &[u8],
-    profile: Profile,
-    now_ms: u64,
-) -> Result<Grant, String> {
+pub fn verify_grant(signed: &SignedGrant, host_carried_key: &[u8], profile: Profile, now_ms: u64) -> Result<Grant, String> {
     let bytes = signed.grant.signed_bytes()?;
     if !macula_rust::node_key::verify(&bytes, &signed.signature, host_carried_key, profile) {
         return Err("the grant's signature does not verify under the host key".into());
@@ -65,10 +55,7 @@ pub struct KeyGrantVerifier {
 
 impl KeyGrantVerifier {
     pub fn new(host_carried_key: Vec<u8>, profile: Profile) -> Self {
-        KeyGrantVerifier {
-            host_carried_key,
-            profile,
-        }
+        KeyGrantVerifier { host_carried_key, profile }
     }
 }
 
@@ -77,18 +64,9 @@ impl GrantVerifier for KeyGrantVerifier {
         verify_grant(signed, &self.host_carried_key, self.profile, now_ms)
     }
 
-    fn verify_revocation(
-        &self,
-        signed: &SignedRevocation,
-        now_ms: u64,
-    ) -> Result<Revocation, String> {
+    fn verify_revocation(&self, signed: &SignedRevocation, now_ms: u64) -> Result<Revocation, String> {
         let bytes = signed.revocation.signed_bytes()?;
-        if !macula_rust::node_key::verify(
-            &bytes,
-            &signed.signature,
-            &self.host_carried_key,
-            self.profile,
-        ) {
+        if !macula_rust::node_key::verify(&bytes, &signed.signature, &self.host_carried_key, self.profile) {
             return Err("the revocation's signature does not verify under the host key".into());
         }
         let host_id = node_id_of(&self.host_carried_key, self.profile);
@@ -97,10 +75,7 @@ impl GrantVerifier for KeyGrantVerifier {
             return Err("the revocation names a host that did not sign it".into());
         }
         if signed.revocation.v != GRANT_VERSION {
-            return Err(format!(
-                "unsupported revocation version {}",
-                signed.revocation.v
-            ));
+            return Err(format!("unsupported revocation version {}", signed.revocation.v));
         }
         let _ = now_ms;
         Ok(signed.revocation.clone())
@@ -109,11 +84,7 @@ impl GrantVerifier for KeyGrantVerifier {
 
 /// An access table for `doc` from a host key and profile named as strings
 /// (the form an invite carries them in).
-pub fn verified_access_from(
-    doc: &str,
-    host_key_hex: &str,
-    profile: &str,
-) -> Result<Access, String> {
+pub fn verified_access_from(doc: &str, host_key_hex: &str, profile: &str) -> Result<Access, String> {
     let key = crate::grant::hex_bytes(host_key_hex)?;
     let profile = Profile::parse(profile).map_err(|e| format!("profile: {e}"))?;
     Ok(verified_access(doc, key, profile))
@@ -123,10 +94,7 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
         return Err("an odd number of hex digits".into());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string())).collect()
 }
 
 /// An access table for `doc` whose grants install only when signed by the
@@ -136,11 +104,7 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
 pub fn verified_access(doc: &str, host_carried_key: Vec<u8>, profile: Profile) -> Access {
     let host_id = node_id_of(&host_carried_key, profile);
     let host_hex: String = host_id.iter().map(|b| format!("{b:02x}")).collect();
-    Access::new(
-        doc,
-        &host_hex,
-        Arc::new(KeyGrantVerifier::new(host_carried_key, profile)),
-    )
+    Access::new(doc, &host_hex, Arc::new(KeyGrantVerifier::new(host_carried_key, profile)))
 }
 
 #[cfg(test)]
@@ -149,8 +113,7 @@ mod tests {
     use craft_collab::{Admission, Role};
 
     fn at(dir: &std::path::Path, slug: &str, name: &str) -> Identity {
-        Identity::load_or_create_with(Profile::PqPure, slug, name, None, Some(dir))
-            .expect("identity")
+        Identity::load_or_create_with(Profile::PqPure, slug, name, None, Some(dir)).expect("identity")
     }
 
     fn grant(host: &Identity, holder: &str, issued: u64, role: Role, nonce: &str) -> Grant {
@@ -171,47 +134,30 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let host = at(dir.path(), "host", "Host");
         let other = at(dir.path(), "other", "Other");
-        let signed =
-            sign_grant(&host, &grant(&host, "0011223344", 100, Role::Editor, "n1")).expect("sign");
+        let signed = sign_grant(&host, &grant(&host, "0011223344", 100, Role::Editor, "n1")).expect("sign");
 
         assert!(verify_grant(&signed, &host.carried_key(), Profile::PqPure, 500).is_ok());
-        assert!(
-            verify_grant(&signed, &other.carried_key(), Profile::PqPure, 500).is_err(),
-            "another key does not verify it"
-        );
-        assert!(
-            verify_grant(&signed, &host.carried_key(), Profile::PqPure, 2_000_000).is_err(),
-            "expiry is enforced"
-        );
+        assert!(verify_grant(&signed, &other.carried_key(), Profile::PqPure, 500).is_err(), "another key does not verify it");
+        assert!(verify_grant(&signed, &host.carried_key(), Profile::PqPure, 2_000_000).is_err(), "expiry is enforced");
     }
 
     #[test]
     fn a_tampered_grant_is_refused() {
         let dir = tempfile::tempdir().expect("temp dir");
         let host = at(dir.path(), "host", "Host");
-        let signed =
-            sign_grant(&host, &grant(&host, "0011223344", 100, Role::Editor, "n1")).expect("sign");
+        let signed = sign_grant(&host, &grant(&host, "0011223344", 100, Role::Editor, "n1")).expect("sign");
 
         let mut moved = signed.clone();
         moved.grant.holder = "0099887766".into();
-        assert!(
-            verify_grant(&moved, &host.carried_key(), Profile::PqPure, 500).is_err(),
-            "the holder field is signed"
-        );
+        assert!(verify_grant(&moved, &host.carried_key(), Profile::PqPure, 500).is_err(), "the holder field is signed");
 
         let mut loosened = signed.clone();
         loosened.grant.expires_ms = 9_000_000;
-        assert!(
-            verify_grant(&loosened, &host.carried_key(), Profile::PqPure, 500).is_err(),
-            "the expiry is signed"
-        );
+        assert!(verify_grant(&loosened, &host.carried_key(), Profile::PqPure, 500).is_err(), "the expiry is signed");
 
         let mut rehosted = signed.clone();
         rehosted.grant.host = "0099".into();
-        assert!(
-            verify_grant(&rehosted, &host.carried_key(), Profile::PqPure, 500).is_err(),
-            "the host field is signed"
-        );
+        assert!(verify_grant(&rehosted, &host.carried_key(), Profile::PqPure, 500).is_err(), "the host field is signed");
     }
 
     #[test]
@@ -222,64 +168,26 @@ mod tests {
         let mut access = verified_access("demo", host.carried_key(), Profile::PqPure);
 
         // A stranger self-asserting Editor with no signature: refused.
-        let self_asserted = SignedGrant {
-            grant: grant(&host, attacker.node_id(), 200, Role::Editor, "forged"),
-            signature: vec![0; 16],
-        };
-        assert!(
-            access.install(&self_asserted, 300).is_err(),
-            "an unsigned self-assertion never installs"
-        );
+        let self_asserted = SignedGrant { grant: grant(&host, attacker.node_id(), 200, Role::Editor, "forged"), signature: vec![0; 16] };
+        assert!(access.install(&self_asserted, 300).is_err(), "an unsigned self-assertion never installs");
 
         // A grant an attacker signed themselves, claiming the host's id: refused.
         let mut impostor = grant(&host, attacker.node_id(), 200, Role::Editor, "impostor");
         impostor.host = host.node_id().to_string();
         let forged = sign_grant(&attacker, &impostor).expect("attacker signs");
-        assert!(
-            access.install(&forged, 300).is_err(),
-            "the host field must be the signer"
-        );
+        assert!(access.install(&forged, 300).is_err(), "the host field must be the signer");
 
         // The host's own grant: installs, and admits the holder.
-        let real = sign_grant(
-            &host,
-            &grant(&host, attacker.node_id(), 200, Role::Editor, "real"),
-        )
-        .expect("sign");
-        access
-            .install(&real, 300)
-            .expect("the host's grant installs");
-        assert!(
-            access
-                .admits(
-                    attacker.node_id(),
-                    &craft_collab::Kind::SnapshotRequest {},
-                    300
-                )
-                .is_admitted()
-        );
+        let real = sign_grant(&host, &grant(&host, attacker.node_id(), 200, Role::Editor, "real")).expect("sign");
+        access.install(&real, 300).expect("the host's grant installs");
+        assert!(access.admits(attacker.node_id(), &craft_collab::Kind::SnapshotRequest {}, 300).is_admitted());
         assert_eq!(access.len(), 1);
 
         // A stale renewal (older issued) cannot downgrade the holder.
-        let stale = sign_grant(
-            &host,
-            &grant(&host, attacker.node_id(), 100, Role::Viewer, "stale"),
-        )
-        .expect("sign");
-        assert!(
-            access.install(&stale, 300).is_err(),
-            "a stale renewal is refused"
-        );
+        let stale = sign_grant(&host, &grant(&host, attacker.node_id(), 100, Role::Viewer, "stale")).expect("sign");
+        assert!(access.install(&stale, 300).is_err(), "a stale renewal is refused");
         assert_eq!(
-            access.admits(
-                attacker.node_id(),
-                &craft_collab::Kind::TextEdit {
-                    para: "1".into(),
-                    update: vec![1],
-                    props: None
-                },
-                300
-            ),
+            access.admits(attacker.node_id(), &craft_collab::Kind::TextEdit { para: "1".into(), update: vec![1], props: None }, 300),
             Admission::Admitted,
             "still the editor grant"
         );

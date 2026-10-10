@@ -53,15 +53,9 @@ impl DeviceRequestProof {
     pub fn to_cbor(&self) -> Value {
         Value::Map(vec![
             (Value::text("v"), Value::Int(DEVICE_REQUEST_VERSION as i128)),
-            (
-                Value::text("timestamp"),
-                Value::Int(self.timestamp_ms as i128),
-            ),
+            (Value::text("timestamp"), Value::Int(self.timestamp_ms as i128)),
             (Value::text("nonce"), Value::text(hex::encode(self.nonce))),
-            (
-                Value::text("signature"),
-                Value::text(hex::encode(&self.signature)),
-            ),
+            (Value::text("signature"), Value::text(hex::encode(&self.signature))),
         ])
     }
 }
@@ -132,9 +126,7 @@ fn canonical_number(n: &serde_json::Number) -> Result<Value, String> {
     if let Some(u) = n.as_u64() {
         return in_range(u as i128);
     }
-    let f = n
-        .as_f64()
-        .ok_or_else(|| "unrepresentable number".to_string())?;
+    let f = n.as_f64().ok_or_else(|| "unrepresentable number".to_string())?;
     if !f.is_finite() {
         return Err("number_out_of_range".into());
     }
@@ -171,20 +163,8 @@ pub fn verify_device_request(
     if skew > PROOF_SKEW_MS {
         return Err("stale_proof".into());
     }
-    let message = device_request_message(
-        public_key,
-        realm_id,
-        procedure,
-        proof.timestamp_ms,
-        &proof.nonce,
-        request,
-    )?;
-    if !macula_rust::node_key::verify(
-        &message,
-        &proof.signature,
-        public_key,
-        macula_rust::profile::Profile::PqHybrid,
-    ) {
+    let message = device_request_message(public_key, realm_id, procedure, proof.timestamp_ms, &proof.nonce, request)?;
+    if !macula_rust::node_key::verify(&message, &proof.signature, public_key, macula_rust::profile::Profile::PqHybrid) {
         return Err("bad_proof".into());
     }
     Ok(())
@@ -202,10 +182,7 @@ mod tests {
     fn the_realm_vector_pins_the_message_bytes() {
         let public_key = vec![7u8; 2592];
         let realm_id: [u8; 32] =
-            hex::decode("abb81b5a614b63551b400b810648c0c8a78efad845442630c94b46cc95d2fcd1")
-                .expect("realm hex")
-                .try_into()
-                .expect("32 bytes");
+            hex::decode("abb81b5a614b63551b400b810648c0c8a78efad845442630c94b46cc95d2fcd1").expect("realm hex").try_into().expect("32 bytes");
         let request = canonical_json(&serde_json::json!({
             "device_info": {"hostname": "laptop.local", "note": null},
             "n": 100.0,
@@ -213,57 +190,22 @@ mod tests {
             "f": 1.5,
         }))
         .expect("canonical");
-        let message = device_request_message(
-            &public_key,
-            &realm_id,
-            JOIN_SESSION_PROCEDURE,
-            1_790_000_000_000,
-            &[0u8; 16],
-            &request,
-        )
-        .expect("message");
+        let message =
+            device_request_message(&public_key, &realm_id, JOIN_SESSION_PROCEDURE, 1_790_000_000_000, &[0u8; 16], &request).expect("message");
         let vector = include_str!("../../tests/vectors/device_request_proof_vector.hex").trim();
-        assert_eq!(
-            hex::encode(&message),
-            vector,
-            "the message must match the realm's vector byte for byte"
-        );
+        assert_eq!(hex::encode(&message), vector, "the message must match the realm's vector byte for byte");
     }
 
     #[test]
     fn the_json_rule_is_the_realms_rule() {
-        assert!(
-            canonical_json(&serde_json::json!(true)).is_err(),
-            "booleans are refused"
-        );
-        assert!(
-            canonical_json(&serde_json::json!(9_007_199_254_740_992u64)).is_err(),
-            "beyond 2^53-1 is refused"
-        );
-        assert_eq!(
-            canonical_json(&serde_json::json!(100.0)).expect("100.0"),
-            Value::Int(100)
-        );
-        assert_eq!(
-            canonical_json(&serde_json::json!(-0.0)).expect("-0.0"),
-            Value::Int(0)
-        );
-        assert_eq!(
-            canonical_json(&serde_json::json!(1.5)).expect("1.5"),
-            Value::Float(1.5)
-        );
-        assert_eq!(
-            canonical_json(&serde_json::json!(null)).expect("null"),
-            Value::Null
-        );
-        assert_eq!(
-            canonical_json(&serde_json::json!("x")).expect("text"),
-            Value::Text("x".into())
-        );
-        assert_eq!(
-            canonical_json(&serde_json::json!(7)).expect("7"),
-            Value::Int(7)
-        );
+        assert!(canonical_json(&serde_json::json!(true)).is_err(), "booleans are refused");
+        assert!(canonical_json(&serde_json::json!(9_007_199_254_740_992u64)).is_err(), "beyond 2^53-1 is refused");
+        assert_eq!(canonical_json(&serde_json::json!(100.0)).expect("100.0"), Value::Int(100));
+        assert_eq!(canonical_json(&serde_json::json!(-0.0)).expect("-0.0"), Value::Int(0));
+        assert_eq!(canonical_json(&serde_json::json!(1.5)).expect("1.5"), Value::Float(1.5));
+        assert_eq!(canonical_json(&serde_json::json!(null)).expect("null"), Value::Null);
+        assert_eq!(canonical_json(&serde_json::json!("x")).expect("text"), Value::Text("x".into()));
+        assert_eq!(canonical_json(&serde_json::json!(7)).expect("7"), Value::Int(7));
     }
 
     #[test]
@@ -273,76 +215,24 @@ mod tests {
             (Value::text("proof"), Value::text("whatever")),
             (Value::text("caller"), Value::text("someone")),
         ]);
-        assert_eq!(
-            canonical_mesh(&payload),
-            Value::Map(vec![(Value::text("public_key"), Value::text("AAAA"))]),
-        );
+        assert_eq!(canonical_mesh(&payload), Value::Map(vec![(Value::text("public_key"), Value::text("AAAA"))]),);
     }
 
     #[test]
     fn a_tampered_request_or_realm_does_not_verify() {
         let public_key = vec![7u8; 2592];
         let realm_id = [9u8; 32];
-        let request =
-            canonical_json(&serde_json::json!({"public_key": "AAAA"})).expect("canonical");
-        let message = device_request_message(
-            &public_key,
-            &realm_id,
-            MEMBERSHIP_UCAN_PROCEDURE,
-            1_000,
-            &[1u8; 16],
-            &request,
-        )
-        .expect("message");
-        let proof = DeviceRequestProof {
-            timestamp_ms: 1_000,
-            nonce: [1u8; 16],
-            signature: b"not-a-real-signature".to_vec(),
-        };
+        let request = canonical_json(&serde_json::json!({"public_key": "AAAA"})).expect("canonical");
+        let message = device_request_message(&public_key, &realm_id, MEMBERSHIP_UCAN_PROCEDURE, 1_000, &[1u8; 16], &request).expect("message");
+        let proof = DeviceRequestProof { timestamp_ms: 1_000, nonce: [1u8; 16], signature: b"not-a-real-signature".to_vec() };
         // A forged signature is refused (the real key never signed it).
-        assert!(
-            verify_device_request(
-                &public_key,
-                &realm_id,
-                MEMBERSHIP_UCAN_PROCEDURE,
-                &request,
-                &proof,
-                1_000
-            )
-            .is_err()
-        );
+        assert!(verify_device_request(&public_key, &realm_id, MEMBERSHIP_UCAN_PROCEDURE, &request, &proof, 1_000).is_err());
         // A proof older than the skew is stale, signature or not.
-        assert!(
-            verify_device_request(
-                &public_key,
-                &realm_id,
-                MEMBERSHIP_UCAN_PROCEDURE,
-                &request,
-                &proof,
-                1_000 + PROOF_SKEW_MS + 1
-            )
-            .is_err()
-        );
+        assert!(verify_device_request(&public_key, &realm_id, MEMBERSHIP_UCAN_PROCEDURE, &request, &proof, 1_000 + PROOF_SKEW_MS + 1).is_err());
         // The message is realm- and procedure-bound: other inputs move the bytes.
-        let other = device_request_message(
-            &public_key,
-            &[8u8; 32],
-            MEMBERSHIP_UCAN_PROCEDURE,
-            1_000,
-            &[1u8; 16],
-            &request,
-        )
-        .expect("message");
+        let other = device_request_message(&public_key, &[8u8; 32], MEMBERSHIP_UCAN_PROCEDURE, 1_000, &[1u8; 16], &request).expect("message");
         assert_ne!(message, other);
-        let other = device_request_message(
-            &public_key,
-            &realm_id,
-            JOIN_SESSION_PROCEDURE,
-            1_000,
-            &[1u8; 16],
-            &request,
-        )
-        .expect("message");
+        let other = device_request_message(&public_key, &realm_id, JOIN_SESSION_PROCEDURE, 1_000, &[1u8; 16], &request).expect("message");
         assert_ne!(message, other);
     }
 }

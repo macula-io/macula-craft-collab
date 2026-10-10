@@ -13,18 +13,13 @@ use macula_craft_collab::{Identity, MeshConfig, MeshTransport};
 
 fn arg(i: usize) -> String {
     std::env::args().nth(i).unwrap_or_else(|| {
-        eprintln!(
-            "usage: forge_probe <host> <port> <node_hex> <realm_hex> <doc> <victim_hex> [forged_name]"
-        );
+        eprintln!("usage: forge_probe <host> <port> <node_hex> <realm_hex> <doc> <victim_hex> [forged_name]");
         std::process::exit(2);
     })
 }
 
 fn hex32(s: &str) -> [u8; 32] {
-    let v: Vec<u8> = (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or(0))
-        .collect();
+    let v: Vec<u8> = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or(0)).collect();
     v.try_into().unwrap_or([0; 32])
 }
 
@@ -37,13 +32,7 @@ fn main() {
     let victim = arg(6);
     let forged_name = std::env::args().nth(7).unwrap_or_else(|| "HACKED".into());
 
-    let cfg = MeshConfig {
-        host,
-        port,
-        station_node_id: station,
-        realm_id: realm,
-        realm_key: Vec::new(),
-    };
+    let cfg = MeshConfig { host, port, station_node_id: station, realm_id: realm, realm_key: Vec::new() };
     let identity = match Identity::load_or_create("pq_hybrid", "forge-probe", "Forger") {
         Ok(identity) => identity,
         Err(e) => {
@@ -63,11 +52,7 @@ fn main() {
 
     // `self` makes the claim honest (the payload author IS the envelope's):
     // a relay check — the cursor must arrive under `forged_name`.
-    let victim = if victim == "self" {
-        forger.clone()
-    } else {
-        victim
-    };
+    let victim = if victim == "self" { forger.clone() } else { victim };
 
     // The claim: the payload's author is the victim, the envelope's is us.
     let msg = Message {
@@ -76,16 +61,10 @@ fn main() {
         epoch: 1,
         seq: 1,
         sent_at_ms: 0,
-        kind: Kind::CursorMoved {
-            position: None,
-            name: Some(forged_name.clone()),
-        },
+        kind: Kind::CursorMoved { position: None, name: Some(forged_name.clone()) },
     };
     match mesh.send(msg) {
-        Ok(()) => println!(
-            "forged-cursor-sent victim={} name={forged_name}",
-            &victim[..8.min(victim.len())]
-        ),
+        Ok(()) => println!("forged-cursor-sent victim={} name={forged_name}", &victim[..8.min(victim.len())]),
         Err(e) => {
             eprintln!("send failed: {e}");
             std::process::exit(1);

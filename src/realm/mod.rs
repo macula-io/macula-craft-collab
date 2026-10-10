@@ -15,9 +15,8 @@ use macula_rust::pool::Pool;
 use serde::{Deserialize, Serialize};
 
 pub use proof::{
-    DEVICE_REQUEST_TAG, DEVICE_REQUEST_VERSION, DeviceRequestProof, JOIN_SESSION_PROCEDURE,
-    MEMBERSHIP_UCAN_PROCEDURE, PROOF_SKEW_MS, canonical_json, canonical_mesh,
-    device_request_message, verify_device_request,
+    DEVICE_REQUEST_TAG, DEVICE_REQUEST_VERSION, DeviceRequestProof, JOIN_SESSION_PROCEDURE, MEMBERSHIP_UCAN_PROCEDURE, PROOF_SKEW_MS, canonical_json,
+    canonical_mesh, device_request_message, verify_device_request,
 };
 pub use session::{ConfirmedSession, CreatedSession, SessionStatus};
 
@@ -75,11 +74,7 @@ impl RealmCredential {
 /// (`mri:org:io.macula`, no person) has no handle. Pure.
 pub fn handle_of(org_identity: &str) -> Option<String> {
     let (_, last) = org_identity.rsplit_once('/')?;
-    if last.is_empty() {
-        None
-    } else {
-        Some(last.to_string())
-    }
+    if last.is_empty() { None } else { Some(last.to_string()) }
 }
 
 /// The realm id of a realm name: macula_realm's `id/1`, the sha256 of the
@@ -94,9 +89,7 @@ pub fn realm_id_of(name: &str) -> [u8; 32] {
 pub fn ucan_expiry_ms(ucan: &str) -> Option<u64> {
     use base64::Engine as _;
     let payload = ucan.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
     let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     json.get("exp")?.as_u64().map(|s| s.saturating_mul(1_000))
 }
@@ -104,28 +97,12 @@ pub fn ucan_expiry_ms(ucan: &str) -> Option<u64> {
 /// Where realm credentials live for this data directory:
 /// `<data>/craft/realm/<node_id>/<realm>.json`, beside the identity keys.
 pub fn realm_dir() -> Option<PathBuf> {
-    Some(
-        crate::identity::craft_data_dir()?
-            .join("craft")
-            .join("realm")
-            .to_path_buf(),
-    )
+    Some(crate::identity::craft_data_dir()?.join("craft").join("realm").to_path_buf())
 }
 
 fn credential_path(dir: &std::path::Path, node_id: &str, realm: &str) -> PathBuf {
-    let safe = |s: &str| {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>()
-    };
-    dir.join(safe(node_id))
-        .join(format!("{}.json", safe(realm)))
+    let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect::<String>();
+    dir.join(safe(node_id)).join(format!("{}.json", safe(realm)))
 }
 
 /// Reads this node's stored credential for a realm, if any. A credential
@@ -136,11 +113,7 @@ pub fn load_credential(node_id: &str, realm: &str) -> Option<RealmCredential> {
 }
 
 /// [`load_credential`] against an explicit directory (tests, custom setups).
-pub fn load_credential_in(
-    dir: &std::path::Path,
-    node_id: &str,
-    realm: &str,
-) -> Option<RealmCredential> {
+pub fn load_credential_in(dir: &std::path::Path, node_id: &str, realm: &str) -> Option<RealmCredential> {
     let bytes = std::fs::read(credential_path(dir, node_id, realm)).ok()?;
     let cred: RealmCredential = serde_json::from_slice(&bytes).ok()?;
     (cred.node_id == node_id).then_some(cred)
@@ -148,16 +121,12 @@ pub fn load_credential_in(
 
 /// Writes a credential beside the keys, owner-only, and returns its path.
 pub fn store_credential(cred: &RealmCredential) -> Result<PathBuf, String> {
-    let dir = realm_dir()
-        .ok_or_else(|| "no per-user data directory for realm credentials".to_string())?;
+    let dir = realm_dir().ok_or_else(|| "no per-user data directory for realm credentials".to_string())?;
     store_credential_in(&dir, cred)
 }
 
 /// [`store_credential`] against an explicit directory.
-pub fn store_credential_in(
-    dir: &std::path::Path,
-    cred: &RealmCredential,
-) -> Result<PathBuf, String> {
+pub fn store_credential_in(dir: &std::path::Path, cred: &RealmCredential) -> Result<PathBuf, String> {
     let path = credential_path(dir, &cred.node_id, &cred.realm);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -221,10 +190,7 @@ fn secure_file(_path: &std::path::Path) {}
 /// is on (`MACULA_CRAFT_AUTOJOIN_REALM`, e.g. `io.macula`). Unset means the
 /// feature does nothing — the same opt-in rollout macula-mcp uses.
 pub fn auto_join_realm() -> Option<String> {
-    std::env::var("MACULA_CRAFT_AUTOJOIN_REALM")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    std::env::var("MACULA_CRAFT_AUTOJOIN_REALM").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// The realm's membership-minting procedure, realm-name-prefixed the way a
@@ -255,27 +221,15 @@ pub fn unwrap_text_field(value: &macula_rust::cbor::Value) -> Option<String> {
 /// One silent device-tier auto-join: proves this node's key for the
 /// membership call and returns the credential it earns, without storing it.
 /// A reply naming another node is refused.
-pub async fn join_device(
-    pool: &Pool,
-    identity: &Identity,
-    realm_name: &str,
-    now_ms: u64,
-) -> Result<RealmCredential, String> {
+pub async fn join_device(pool: &Pool, identity: &Identity, realm_name: &str, now_ms: u64) -> Result<RealmCredential, String> {
     use base64::Engine as _;
     use macula_rust::cbor::Value;
 
     let realm_id = realm_id_of(realm_name);
     let public_key = base64::engine::general_purpose::STANDARD.encode(identity.carried_key());
-    let request = Value::Map(vec![(
-        Value::text("public_key"),
-        Value::text(public_key.clone()),
-    )]);
-    let proof =
-        identity.device_request_proof(&realm_id, MEMBERSHIP_UCAN_PROCEDURE, &request, now_ms)?;
-    let payload = Value::Map(vec![
-        (Value::text("public_key"), Value::text(public_key)),
-        (Value::text("proof"), proof.to_cbor()),
-    ]);
+    let request = Value::Map(vec![(Value::text("public_key"), Value::text(public_key.clone()))]);
+    let proof = identity.device_request_proof(&realm_id, MEMBERSHIP_UCAN_PROCEDURE, &request, now_ms)?;
+    let payload = Value::Map(vec![(Value::text("public_key"), Value::text(public_key)), (Value::text("proof"), proof.to_cbor())]);
     let call = macula_rust::pool::Call {
         realm: realm_id,
         procedure: membership_ucan_procedure(realm_name),
@@ -286,25 +240,17 @@ pub async fn join_device(
         proofs: Vec::new(),
         confidential: Default::default(),
     };
-    let reply = pool
-        .call(call)
-        .await
-        .map_err(|e| format!("issue_membership_ucan: {e:?}"))?;
+    let reply = pool.call(call).await.map_err(|e| format!("issue_membership_ucan: {e:?}"))?;
     let citizen_did = reply.get("citizen_did").and_then(unwrap_text_field);
     let ucan = reply.get("ucan").and_then(unwrap_text_field);
     if let Some(error) = reply.get("error").and_then(unwrap_text_field) {
         return Err(format!("issue_membership_ucan refused: {error}"));
     }
     let (Some(citizen_did), Some(ucan)) = (citizen_did, ucan) else {
-        return Err(format!(
-            "issue_membership_ucan returned an unexpected shape: {reply:?}"
-        ));
+        return Err(format!("issue_membership_ucan returned an unexpected shape: {reply:?}"));
     };
     if !citizen_did.eq_ignore_ascii_case(identity.node_id()) {
-        return Err(format!(
-            "issue_membership_ucan names {citizen_did}, not this node {}",
-            identity.node_id()
-        ));
+        return Err(format!("issue_membership_ucan names {citizen_did}, not this node {}", identity.node_id()));
     }
     Ok(RealmCredential {
         node_id: identity.node_id().to_string(),
@@ -335,15 +281,10 @@ pub async fn ensure_auto_join(pool: &Pool, identity: &Identity, now_ms: u64) {
     match join_device(pool, identity, &realm_name, now_ms).await {
         Ok(cred) => {
             if let Err(e) = store_credential(&cred) {
-                log_stderr(&format!(
-                    "realm auto-join: storing the credential failed: {e}"
-                ));
+                log_stderr(&format!("realm auto-join: storing the credential failed: {e}"));
             }
         }
-        Err(e) => log_stderr(&format!(
-            "realm auto-join of {} against {realm_name} failed: {e}",
-            identity.node_id()
-        )),
+        Err(e) => log_stderr(&format!("realm auto-join of {} against {realm_name} failed: {e}", identity.node_id())),
     }
 }
 
@@ -357,18 +298,12 @@ mod tests {
 
     #[test]
     fn the_realm_id_is_the_sha256_of_the_name() {
-        assert_eq!(
-            hex::encode(realm_id_of("io.macula")),
-            "abb81b5a614b63551b400b810648c0c8a78efad845442630c94b46cc95d2fcd1"
-        );
+        assert_eq!(hex::encode(realm_id_of("io.macula")), "abb81b5a614b63551b400b810648c0c8a78efad845442630c94b46cc95d2fcd1");
     }
 
     #[test]
     fn handles_and_expiry_read_the_way_the_realm_writes_them() {
-        assert_eq!(
-            handle_of("mri:org:io.macula/rgfaber").as_deref(),
-            Some("rgfaber")
-        );
+        assert_eq!(handle_of("mri:org:io.macula/rgfaber").as_deref(), Some("rgfaber"));
         assert_eq!(handle_of("mri:org:io.macula/"), None);
         assert_eq!(handle_of("mri:org:io.macula"), None, "a device-tier org identity has no person");
         let ucan = "eyJhbGciOiJFUzI1NiJ9.eyJleHAiOjE3OTIwMDAwMDAsImNhbiI6InJlYWxtL21lbWJlciJ9.sig";
@@ -393,15 +328,8 @@ mod tests {
             tier: Tier::Citizen,
         };
         let path = store_credential_in(dir.path(), &cred).expect("store");
-        assert_eq!(
-            load_credential_in(dir.path(), "0011", "io.macula").as_ref(),
-            Some(&cred)
-        );
-        assert_eq!(
-            load_credential_in(dir.path(), "0022", "io.macula"),
-            None,
-            "another node reads nothing"
-        );
+        assert_eq!(load_credential_in(dir.path(), "0011", "io.macula").as_ref(), Some(&cred));
+        assert_eq!(load_credential_in(dir.path(), "0022", "io.macula"), None, "another node reads nothing");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

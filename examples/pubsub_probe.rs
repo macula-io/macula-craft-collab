@@ -11,18 +11,13 @@ use macula_craft_collab::{Identity, MeshConfig, MeshTransport};
 
 fn arg(i: usize) -> String {
     std::env::args().nth(i).unwrap_or_else(|| {
-        eprintln!(
-            "usage: pubsub_probe <host> <port> <node_hex> <realm_hex> <label> <listen|send|both>"
-        );
+        eprintln!("usage: pubsub_probe <host> <port> <node_hex> <realm_hex> <label> <listen|send|both>");
         std::process::exit(2);
     })
 }
 
 fn hex32(s: &str) -> [u8; 32] {
-    let v: Vec<u8> = (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or(0))
-        .collect();
+    let v: Vec<u8> = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or(0)).collect();
     v.try_into().unwrap_or([0; 32])
 }
 
@@ -34,23 +29,8 @@ fn main() {
     let label = arg(5);
     let mode = arg(6);
 
-    let cfg = MeshConfig {
-        host,
-        port,
-        station_node_id: station,
-        realm_id: realm,
-        realm_key: Vec::new(),
-    };
-    let slug: String = label
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
+    let cfg = MeshConfig { host, port, station_node_id: station, realm_id: realm, realm_key: Vec::new() };
+    let slug: String = label.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
     let identity = match Identity::load_or_create("pq_hybrid", &slug, &label) {
         Ok(identity) => identity,
         Err(e) => {
@@ -75,10 +55,7 @@ fn main() {
             epoch: 1,
             seq: 1,
             sent_at_ms: 0,
-            kind: Kind::CursorMoved {
-                position: Some(format!("hello from {label}")),
-                name: Some(label.clone()),
-            },
+            kind: Kind::CursorMoved { position: Some(format!("hello from {label}")), name: Some(label.clone()) },
         };
         match mesh.send(msg) {
             Ok(()) => println!("{label}: sent"),
