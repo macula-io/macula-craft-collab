@@ -83,6 +83,12 @@ impl MeshTransport {
 /// What the background thread publishes.
 enum Outbound {
     Publish(&'static str, String),
+    /// A realm device-tier join, run on the transport's own pool; the
+    /// answer carries the credential (already stored here on success).
+    DeviceJoin {
+        realm_name: String,
+        reply: std::sync::mpsc::SyncSender<Result<RealmCredential, String>>,
+    },
 }
 
 impl MeshTransport {
@@ -95,6 +101,7 @@ impl MeshTransport {
         let cfg = cfg.clone();
         let author = identity.node_id().to_string();
         let key = identity.key();
+        let identity = identity.clone();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let dropped_in_thread = dropped.clone();
         std::thread::Builder::new()
@@ -110,7 +117,7 @@ impl MeshTransport {
                         return;
                     }
                 };
-                rt.block_on(run(cfg, key, in_tx, ready_tx, dropped_in_thread));
+                rt.block_on(run(cfg, key, identity, in_tx, ready_tx, dropped_in_thread));
             })
             .map_err(|e| format!("thread: {e}"))?;
         match ready_rx.recv() {
@@ -126,11 +133,30 @@ impl MeshTransport {
     }
 }
 
+impl MeshTransport {
+    /// A silent device-tier join of `realm_name` through this transport's
+    /// own pool: proves the key, asks the realm for a membership, stores
+    /// the credential beside the identity keys. Blocking; call it from a
+    /// worker thread (the UI does) or at startup.
+    pub fn join_realm_device(&self, realm_name: &str) -> Result<RealmCredential, String> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.out
+            .send(Outbound::DeviceJoin {
+                realm_name: realm_name.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "the mesh transport is closed".to_string())?;
+        rx.recv()
+            .map_err(|_| "the mesh transport ended before the join answered".to_string())?
+    }
+}
+
 /// Runs until the transport is dropped: then the outbound channel closes,
 /// the loop ends and the pool closes.
 async fn run(
     cfg: MeshConfig,
     key: Arc<NodeKey>,
+    identity: Identity,
     in_tx: Sender<Message>,
     ready: std::sync::mpsc::Sender<Result<UnboundedSender<Outbound>, String>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -153,6 +179,27 @@ async fn run(
             return;
         }
     };
+
+    // The silent device-tier realm membership, at first connect: opt-in
+    // (MACULA_CRAFT_AUTOJOIN_REALM) and only when a realm key is pinned
+    // (a call can only be resolved under it). Non-fatal by design.
+    if cfg.realm_key.is_empty() {
+        if realm::auto_join_realm().is_some() {
+            eprintln!(
+                "realm auto-join: no realm key pinned in this config; skipping (calls need the trust anchor)"
+            );
+        }
+    } else {
+        let pool_for_join = pool.clone();
+        let identity_for_join = identity.clone();
+        tokio::spawn(async move {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            realm::ensure_auto_join(&pool_for_join, &identity_for_join, now).await;
+        });
+    }
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
     for topic in [
@@ -202,6 +249,20 @@ async fn run(
     let realm = cfg.realm_id;
     while let Some(out) = out_rx.recv().await {
         match out {
+            Outbound::DeviceJoin { realm_name, reply } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let outcome = match realm::join_device(&pool, &identity, &realm_name, now).await {
+                    Ok(cred) => match realm::store_credential(&cred) {
+                        Ok(_) => Ok(cred),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(outcome);
+            }
             Outbound::Publish(topic, json) => {
                 let payload = Value::Map(vec![(Value::text("json"), Value::text(json))]);
                 let _ = pool

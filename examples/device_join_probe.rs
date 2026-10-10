@@ -56,7 +56,8 @@ fn main() {
         let mut opts = Opts::new(identity.key());
         // Calls resolve procedure advertisements under the realm's pinned
         // key — the same public trust anchor macula-mcp pins; pubsub needs none.
-        opts.realm_trust.insert(realm::realm_id_of(&realm_name), realm_key);
+        opts.realm_trust
+            .insert(realm::realm_id_of(&realm_name), realm_key);
         let pool = Pool::connect(
             vec![Seed {
                 host,
