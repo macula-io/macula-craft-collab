@@ -71,9 +71,10 @@ impl RealmCredential {
     }
 }
 
-/// `mri:org:io.macula/rgfaber` -> `rgfaber`. Pure.
+/// `mri:org:io.macula/rgfaber` -> `rgfaber`; a device-tier org identity
+/// (`mri:org:io.macula`, no person) has no handle. Pure.
 pub fn handle_of(org_identity: &str) -> Option<String> {
-    let last = org_identity.rsplit('/').next()?;
+    let (_, last) = org_identity.rsplit_once('/')?;
     if last.is_empty() {
         None
     } else {
@@ -369,6 +370,7 @@ mod tests {
             Some("rgfaber")
         );
         assert_eq!(handle_of("mri:org:io.macula/"), None);
+        assert_eq!(handle_of("mri:org:io.macula"), None, "a device-tier org identity has no person");
         let ucan = "eyJhbGciOiJFUzI1NiJ9.eyJleHAiOjE3OTIwMDAwMDAsImNhbiI6InJlYWxtL21lbWJlciJ9.sig";
         assert_eq!(ucan_expiry_ms(ucan), Some(1_792_000_000_000));
         assert_eq!(ucan_expiry_ms("not-a-jwt"), None);
