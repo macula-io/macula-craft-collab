@@ -17,7 +17,7 @@ pub mod realm;
 pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verified_access_from, verify_grant};
 pub use identity::Identity;
 pub use issuer::{IdentityIssuer, verify_invite};
-pub use realm::{RealmCredential, Tier};
+pub use realm::{RealmCredential, RealmMemberVerifier, Tier};
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};

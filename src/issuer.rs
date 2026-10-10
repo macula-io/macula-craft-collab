@@ -142,7 +142,8 @@ mod tests {
             seed: "station.example:4433:bb".to_string(),
             issued_ms: 1_000,
             expires_ms: 61_000,
-            token,
+            token: Some(token),
+            member_role: None,
             signature: Vec::new(),
         };
         assert!(verify_invite(&invite).is_err(), "unsigned is refused");
@@ -157,7 +158,7 @@ mod tests {
 
         // A swapped token breaks it too.
         let mut tampered = invite.clone();
-        tampered.token.signature.push(9);
+        tampered.token.as_mut().expect("token").signature.push(9);
         assert!(verify_invite(&tampered).is_err(), "the token is covered");
 
         // Signing with another identity does not pass as the named host.

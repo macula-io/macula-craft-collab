@@ -265,6 +265,32 @@ pub async fn renew_membership(pool: &Pool, identity: &Identity, realm_name: &str
     Ok(cred)
 }
 
+/// The seam's membership verifier over a realm's UCANs: what a host runs
+/// when a document is shared with a realm. It holds the realm's pinned key
+/// and the role members are admitted with; nothing about a presented token
+/// is trusted beyond the realm's own signature and the audience check.
+pub struct RealmMemberVerifier {
+    realm: String,
+    realm_key: Vec<u8>,
+    role: craft_collab::Role,
+}
+
+impl RealmMemberVerifier {
+    pub fn new(realm: &str, realm_key: Vec<u8>, role: craft_collab::Role) -> Self {
+        RealmMemberVerifier { realm: realm.to_string(), realm_key, role }
+    }
+}
+
+impl craft_collab::MembershipVerifier for RealmMemberVerifier {
+    fn verify_member(&self, ucan: &str, node_id: &str, now_ms: u64) -> Result<(), String> {
+        verify_membership(ucan, &self.realm_key, &self.realm, node_id, (now_ms / 1_000) as i64)
+    }
+
+    fn role(&self) -> craft_collab::Role {
+        self.role
+    }
+}
+
 /// The realm's membership-minting procedure, realm-name-prefixed the way a
 /// procedure advertisement carries it.
 pub fn membership_ucan_procedure(realm_name: &str) -> String {
@@ -420,6 +446,35 @@ mod tests {
         assert!(verify_membership(&token, &realm_key.public_key(), "net.other", &node_hex, now_s).is_err(), "another realm does not match");
         let wrong_can = mint("member/something-else", "mri:realm:io.macula");
         assert!(verify_membership(&wrong_can, &realm_key.public_key(), "io.macula", &node_hex, now_s).is_err(), "a non-member capability is refused");
+    }
+
+    #[test]
+    fn the_seam_verifier_admits_members_of_its_own_realm() {
+        use craft_collab::MembershipVerifier as _;
+        use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
+        use macula_rust::profile::Profile;
+        use macula_rust::ucan::{Capability, Options, create};
+
+        let realm_key = NodeKey::generate_identity(Profile::PqHybrid, PUZZLE_DIFFICULTY).expect("realm key");
+        let member = NodeKey::generate_identity(Profile::PqHybrid, PUZZLE_DIFFICULTY).expect("member key");
+        let audience = member.node_id().expect("node id");
+        let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_secs() as i64;
+        let token = create(
+            &realm_key,
+            &audience,
+            &[Capability { with: "mri:realm:io.macula".into(), can: MEMBER_DEVICE_CAN.into() }],
+            &Options { exp: now_s + 3_600, ..Options::default() },
+        )
+        .expect("mint");
+        let token = String::from_utf8(token).expect("jwt");
+        let node_hex = hex::encode(audience);
+
+        let verifier = RealmMemberVerifier::new("io.macula", realm_key.public_key(), craft_collab::Role::Editor);
+        assert_eq!(verifier.role(), craft_collab::Role::Editor);
+        let now_ms = (now_s as u64) * 1_000;
+        verifier.verify_member(&token, &node_hex, now_ms).expect("its own member verifies");
+        assert!(verifier.verify_member(&token, &hex::encode([9u8; 32]), now_ms).is_err(), "another node's token is not a membership for this caller");
+        assert!(verifier.verify_member("not-a-jwt", &node_hex, now_ms).is_err());
     }
 
     #[test]
