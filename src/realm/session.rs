@@ -35,7 +35,9 @@ pub enum SessionStatus {
     Error(String),
 }
 
-/// A confirmed join session: the membership material the realm issued.
+/// A confirmed join session: the membership material the realm issued. The
+/// realm's controller sends `{status, org_identity, cert_pem, citizen_did,
+/// ucan}`; `refresh_token` is empty on that path and `account` absent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmedSession {
     pub refresh_token: String,
@@ -114,12 +116,16 @@ pub fn parse_session_status(status: i32, body: &str) -> SessionStatus {
     if status == 200 && field("status").as_deref() == Some("pending") {
         return SessionStatus::Pending { expires_at: field("expires_at").unwrap_or_default() };
     }
+    // The realm's controller renders a confirmed session as {status,
+    // org_identity, cert_pem, citizen_did, ucan}: org_identity is always
+    // present, the rest are optional, and there is no refresh_token on this
+    // path (found live; the mock had drifted from the controller).
     if status == 200
         && field("status").as_deref() == Some("confirmed")
-        && let (Some(refresh_token), Some(org_identity)) = (field("refresh_token"), field("org_identity"))
+        && let Some(org_identity) = field("org_identity")
     {
         return SessionStatus::Confirmed(ConfirmedSession {
-            refresh_token,
+            refresh_token: field("refresh_token").unwrap_or_default(),
             org_identity,
             cert_pem: field("cert_pem"),
             account: field("oauth_account"),
@@ -289,7 +295,12 @@ mod tests {
                 Ok(0) => ("200 OK".into(), r#"{"status":"pending","expires_at":"+10m"}"#.into()),
                 _ => (
                     "200 OK".into(),
-                    r#"{"status":"confirmed","refresh_token":"rt-1","org_identity":"mri:org:io.macula/rgfaber","oauth_account":"raf@example.com","ucan":"eyJhbGciOiJFUzI1NiJ9.eyJleHAiOjE3OTIwMDAwMDB9.sig"}"#.into(),
+                    concat!(
+                        r#"{"status":"confirmed","org_identity":"mri:org:io.macula/rgfaber","#,
+                        r#""cert_pem":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n","#,
+                        r#""citizen_did":"0011","ucan":"eyJhbGciOiJFUzI1NiJ9.eyJleHAiOjE3OTIwMDAwMDB9.sig"}"#
+                    )
+                    .into(),
                 ),
             }
         } else {
@@ -371,6 +382,36 @@ mod tests {
             proof::verify_device_request(&id.carried_key(), &crate::realm::realm_id_of("io.macula"), JOIN_SESSION_PROCEDURE, &signed, &proof, 1_000)
                 .is_ok()
         );
+    }
+
+    /// Raf's citizen flow, live: the realm's controller renders a confirmed
+    /// session as {status, org_identity, cert_pem, citizen_did, ucan} — no
+    /// refresh_token, no oauth_account. This is that exact body.
+    #[test]
+    fn rafs_citizen_confirmation_is_accepted_and_stored() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let id = identity(dir.path());
+        let body = concat!(
+            r#"{"status":"confirmed","org_identity":"mri:org:io.macula/rgfaber","#,
+            r#""cert_pem":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n","#,
+            r#""citizen_did":"0011","ucan":"eyJhbGciOiJFUzI1NiJ9.eyJleHAiOjE3OTIwMDAwMDB9.sig"}"#
+        );
+        let status = parse_session_status(200, body);
+        let SessionStatus::Confirmed(confirmed) = status else {
+            panic!("a real confirmed body must parse as Confirmed, got {status:?}");
+        };
+        assert_eq!(confirmed.org_identity, "mri:org:io.macula/rgfaber");
+        assert_eq!(confirmed.refresh_token, "", "the realm sends none on this path");
+        assert!(confirmed.account.is_none(), "and no oauth account");
+        assert!(confirmed.cert_pem.is_some() && confirmed.citizen_did.is_some() && confirmed.ucan.is_some());
+
+        let cred = credential_from_confirmed(&id, "io.macula", "https://realm.macula.io", confirmed, 1_000);
+        assert_eq!(cred.tier, crate::realm::Tier::Citizen);
+        assert_eq!(cred.handle().as_deref(), Some("rgfaber"), "the handle comes from org_identity");
+        assert_eq!(cred.ucan_expires_ms(), Some(1_792_000_000_000));
+        let path = crate::realm::store_credential_in(dir.path(), &cred).expect("store");
+        assert!(path.exists());
+        assert_eq!(crate::realm::load_credential_in(dir.path(), id.node_id(), "io.macula"), Some(cred));
     }
 
     #[test]
