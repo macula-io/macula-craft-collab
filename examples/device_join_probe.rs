@@ -55,7 +55,7 @@ fn main() {
                 // UCAN must verify for THIS node and no one else.
                 let now_s = (now / 1_000) as i64;
                 match realm::verify_membership(cred.ucan.as_deref().unwrap_or(""), &realm_key, &realm_name, &cred.node_id, now_s) {
-                    Ok(()) => println!("membership verifies at the realm's key for this node"),
+                    Ok(ends_ms) => println!("membership verifies at the realm's key for this node (ends {ends_ms} ms)"),
                     Err(e) => println!("membership verify failed: {e}"),
                 }
                 // The refresh leg: a device membership re-mints (a fresh

@@ -205,8 +205,10 @@ pub const RENEW_MARGIN_MS: u64 = 30 * 60 * 1_000;
 /// issued by the realm's own key, audience = the verified caller (exactly
 /// the presenting node), a member capability on this realm. `authorize`
 /// checks the audience itself, so a token that names anyone else is
-/// refused; the capability check pins the realm and the `can`.
-pub fn verify_membership(ucan: &str, realm_key: &[u8], realm_name: &str, node_id: &str, now_s: i64) -> Result<(), String> {
+/// refused; the capability check pins the realm and the `can`. Returns when
+/// the membership ends (ms since the epoch, from the UCAN's `exp`), so the
+/// caller can keep a document grant from outliving it.
+pub fn verify_membership(ucan: &str, realm_key: &[u8], realm_name: &str, node_id: &str, now_s: i64) -> Result<u64, String> {
     let caller: [u8; 32] =
         hex::decode(node_id).map_err(|e| format!("node id: {e}"))?.try_into().map_err(|_| "node id is not 32 bytes".to_string())?;
     let realm_with = format!("mri:realm:{realm_name}");
@@ -223,7 +225,8 @@ pub fn verify_membership(ucan: &str, realm_key: &[u8], realm_name: &str, node_id
         if let Ok(claims) = macula_rust::ucan::authorize(ucan.as_bytes(), &policy, &ctx)
             && capability_covers(&claims, &realm_with, can)
         {
-            return Ok(());
+            let ends_ms = claims.get("exp").and_then(|v| v.as_u64()).map(|s| s.saturating_mul(1_000)).unwrap_or(u64::MAX);
+            return Ok(ends_ms);
         }
     }
     Err("not a member of this realm, or the token is not this node's".into())
@@ -282,7 +285,7 @@ impl RealmMemberVerifier {
 }
 
 impl craft_collab::MembershipVerifier for RealmMemberVerifier {
-    fn verify_member(&self, ucan: &str, node_id: &str, now_ms: u64) -> Result<(), String> {
+    fn verify_member(&self, ucan: &str, node_id: &str, now_ms: u64) -> Result<u64, String> {
         verify_membership(ucan, &self.realm_key, &self.realm, node_id, (now_ms / 1_000) as i64)
     }
 
@@ -433,7 +436,8 @@ mod tests {
         };
         let token = mint(MEMBER_DEVICE_CAN, "mri:realm:io.macula");
         let node_hex = hex::encode(audience);
-        verify_membership(&token, &realm_key.public_key(), "io.macula", &node_hex, now_s).expect("its own audience and realm verify");
+        let ends_ms = verify_membership(&token, &realm_key.public_key(), "io.macula", &node_hex, now_s).expect("its own audience and realm verify");
+        assert_eq!(ends_ms, ((now_s + 3_600) as u64) * 1_000, "the membership's own end comes back with it");
         assert!(
             verify_membership(&token, &realm_key.public_key(), "io.macula", &hex::encode([9u8; 32]), now_s).is_err(),
             "another node's claims are refused"
@@ -472,7 +476,8 @@ mod tests {
         let verifier = RealmMemberVerifier::new("io.macula", realm_key.public_key(), craft_collab::Role::Editor);
         assert_eq!(verifier.role(), craft_collab::Role::Editor);
         let now_ms = (now_s as u64) * 1_000;
-        verifier.verify_member(&token, &node_hex, now_ms).expect("its own member verifies");
+        let ends_ms = verifier.verify_member(&token, &node_hex, now_ms).expect("its own member verifies");
+        assert_eq!(ends_ms, ((now_s + 3_600) as u64) * 1_000, "and it reports when the membership ends");
         assert!(verifier.verify_member(&token, &hex::encode([9u8; 32]), now_ms).is_err(), "another node's token is not a membership for this caller");
         assert!(verifier.verify_member("not-a-jwt", &node_hex, now_ms).is_err());
     }
