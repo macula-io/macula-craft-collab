@@ -204,7 +204,7 @@ mod tests {
         let text = include_str!("../../tests/vectors/io.macula.well-known.json");
         let fp = fingerprint(&io_macula().1);
         let mut trust = RealmTrust::default();
-        let err = trust.trust_descriptor("net.beam-campus", text, &fp).err().expect("a descriptor for another name");
+        let err = trust.trust_descriptor("net.beam-campus", text, &fp).expect_err("a descriptor for another name");
         assert!(err.contains("io.macula"), "{err}");
         assert!(trust.entry("net.beam-campus").is_none() && trust.entry("io.macula").is_none(), "nothing trusted");
         let entry = trust.trust_descriptor("io.macula", text, &fp).expect("the name meant");
