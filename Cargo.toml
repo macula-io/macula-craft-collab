@@ -12,7 +12,7 @@ todo = "warn"
 
 [package]
 name = "macula-craft-collab"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "Co-edit documents over the Macula mesh: the transport, identity, grants and realm membership for the macula-craft-seam collaboration seam."
@@ -37,7 +37,9 @@ hex = "0.4"
 base64 = "0.22"
 sha2 = "0.11"
 getrandom = "0.2"
-minreq = { version = "2", features = ["https-rustls"] }
+minreq = { version = "3", features = ["https-rustls"] }
+# minreq's TLS; aws-lc-rs is installed as the process provider (realm/session.rs)
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
 
 [dev-dependencies]
 # same versions macula-rust uses, so the fake KeyStore in tests is its trait's types

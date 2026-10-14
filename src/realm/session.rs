@@ -11,6 +11,16 @@ use serde_json::{Value as Json, json};
 use crate::identity::Identity;
 use crate::realm::proof::{self, DeviceRequestProof, JOIN_SESSION_PROCEDURE};
 
+/// Makes aws-lc-rs the process's TLS provider before the first HTTPS call. The mesh stack
+/// compiles rustls' ring provider in too, and with two providers rustls picks none, so
+/// minreq's `ClientConfig::builder()` would panic. A provider installed earlier stands.
+fn tls_ready() {
+    static TLS: std::sync::Once = std::sync::Once::new();
+    TLS.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 /// The realm service origin for a realm name: `io.macula` ->
 /// `https://realm.macula.io` (realm labels reversed, `realm.` prefixed).
 pub fn realm_base_url(realm_name: &str) -> String {
@@ -75,6 +85,7 @@ pub fn create_session(realm_name: &str, base_url: &str, identity: &Identity, now
 /// POSTs the prepared body; see [`create_session`].
 pub fn post_join_session(base_url: &str, body: &Json) -> Result<CreatedSession, String> {
     let url = format!("{}/api/v1/join/sessions", base_url.trim_end_matches('/'));
+    tls_ready();
     let res = minreq::post(&url)
         .with_header("content-type", "application/json")
         .with_header("accept", "application/json")
@@ -83,7 +94,7 @@ pub fn post_join_session(base_url: &str, body: &Json) -> Result<CreatedSession, 
         .send()
         .map_err(|e| format!("{url}: {e}"))?;
     let text = res.as_str().map_err(|e| format!("{url}: {e}"))?;
-    parse_created(res.status_code, text)
+    parse_created(i32::from(res.status_code), text)
 }
 
 /// Shapes a create reply (2xx with `session_id`/`join_url`) or a refusal.
@@ -101,9 +112,10 @@ pub fn parse_created(status: i32, body: &str) -> Result<CreatedSession, String> 
 /// Polls a session: pending, confirmed, expired, or an error.
 pub fn poll_session(base_url: &str, session_id: &str) -> Result<SessionStatus, String> {
     let url = format!("{}/api/v1/join/sessions/{}", base_url.trim_end_matches('/'), urlencode(session_id));
+    tls_ready();
     let res = minreq::get(&url).with_header("accept", "application/json").with_timeout(10).send().map_err(|e| format!("{url}: {e}"))?;
     let text = res.as_str().map_err(|e| format!("{url}: {e}"))?;
-    Ok(parse_session_status(res.status_code, text))
+    Ok(parse_session_status(i32::from(res.status_code), text))
 }
 
 /// Shapes a poll reply. Pure.
@@ -187,6 +199,15 @@ mod tests {
     use macula_rust::profile::Profile;
 
     use super::*;
+
+    #[test]
+    fn https_has_a_tls_provider_beside_the_mesh_stack() {
+        // ring (from the mesh stack) and aws-lc-rs (minreq's) are both compiled in; without
+        // tls_ready, rustls picks neither and minreq's ClientConfig::builder() panics.
+        tls_ready();
+        let config = rustls::ClientConfig::builder().with_root_certificates(rustls::RootCertStore::empty()).with_no_client_auth();
+        assert!(!config.crypto_provider().cipher_suites.is_empty());
+    }
 
     fn identity(dir: &std::path::Path) -> Identity {
         Identity::load_or_create_with(Profile::PqHybrid, "joiner", "Joiner", None, Some(dir)).expect("identity")
