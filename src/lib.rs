@@ -9,11 +9,13 @@
 //! `craft/collab/document_shared_v1`; the document id, author and payload are
 //! in the message itself.
 
+pub mod craft_mesh;
 pub mod grant;
 pub mod identity;
 pub mod issuer;
 pub mod realm;
 
+pub use craft_mesh::{CraftMesh, DEFAULT_REALM};
 pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verified_access_from, verify_grant};
 pub use identity::Identity;
 pub use issuer::{IdentityIssuer, verify_invite};
