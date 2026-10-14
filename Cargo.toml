@@ -12,7 +12,7 @@ todo = "warn"
 
 [package]
 name = "macula-craft-collab"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Co-edit documents over the Macula mesh: the transport, identity, grants and realm membership for the macula-craft-seam collaboration seam."
@@ -27,7 +27,7 @@ workspace = true
 
 [dependencies]
 # the collaboration seam (code keeps the craft_collab name)
-craft-collab = { package = "macula-craft-seam", version = "0.2" }
+craft-collab = { package = "macula-craft-seam", version = "0.3" }
 # released crates only
 macula-rust = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
