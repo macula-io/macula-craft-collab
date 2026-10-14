@@ -15,14 +15,18 @@ name = "macula-craft-collab"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "The Macula mesh transport for the shared Craft collaboration seam: document text edits, cursor presence, join snapshots and persistent identity over macula-rust (released crates only)."
-publish = false
+description = "Co-edit documents over the Macula mesh: the transport, identity, grants and realm membership for the macula-craft-seam collaboration seam."
+repository = "https://github.com/macula-io/macula-craft-collab"
+readme = "README.md"
+keywords = ["collaboration", "macula", "mesh", "editor", "p2p"]
+categories = ["text-editors", "network-programming"]
+exclude = [".github"]
 
 [lints]
 workspace = true
 
 [dependencies]
-# the shared seam (spike branch of the craft-libs fork)
+# the collaboration seam (code keeps the craft_collab name)
 craft-collab = { path = "../../rgfaber/craft-libs/crates/collab", package = "macula-craft-seam", version = "0.1" }
 # released crates only
 macula-rust = "0.9"

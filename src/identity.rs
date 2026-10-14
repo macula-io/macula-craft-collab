@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 /// The secure-store service every Craft app shares, so one device has one
 /// Craft identity per person per app family.
-pub const IDENTITY_SERVICE: &str = "com.storytold.craft";
+pub const IDENTITY_SERVICE: &str = "io.macula.craft";
 
 /// Which backend holds this identity's key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
