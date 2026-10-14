@@ -226,7 +226,9 @@ pub fn verify_membership(ucan: &str, realm_key: &[u8], realm_name: &str, node_id
         if let Ok(claims) = macula_rust::ucan::authorize(ucan.as_bytes(), &policy, &ctx)
             && capability_covers(&claims, &realm_with, can)
         {
-            let ends_ms = claims.get("exp").and_then(|v| v.as_u64()).map(|s| s.saturating_mul(1_000)).unwrap_or(u64::MAX);
+            // A membership with no end is not one a grant can be capped at:
+            // refused rather than read as forever.
+            let ends_ms = claims.get("exp").and_then(|v| v.as_u64()).map(|s| s.saturating_mul(1_000)).ok_or("a membership with no expiry")?;
             return Ok(ends_ms);
         }
     }

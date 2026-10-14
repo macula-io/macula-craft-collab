@@ -108,6 +108,22 @@ impl RealmTrust {
         Ok(entry)
     }
 
+    /// Trusts the realm a descriptor publishes, only under the name the
+    /// person meant (`name`) and the fingerprint they checked. A descriptor
+    /// binds its key to its fingerprint; only the person binds the name.
+    pub fn trust_descriptor(&mut self, name: &str, descriptor_json: &str, confirmed_fingerprint: &str) -> Result<&TrustedRealm, String> {
+        let (descriptor, key) = RealmDescriptor::parse(descriptor_json)?;
+        if descriptor.realm != name.trim() {
+            return Err(format!("this descriptor is for {}, not {}; not trusted", descriptor.realm, name.trim()));
+        }
+        self.trust(&descriptor.realm, &key, confirmed_fingerprint)
+    }
+
+    /// A trusted realm's entry.
+    pub fn entry(&self, name: &str) -> Option<&TrustedRealm> {
+        self.realms.get(name.trim())
+    }
+
     /// Stops trusting `name`; whether it was trusted.
     pub fn untrust(&mut self, name: &str) -> bool {
         self.realms.remove(name.trim()).is_some()
@@ -178,6 +194,22 @@ mod tests {
         assert!(trust.trust("io.macula", &other_key, &fingerprint(&other_key)).is_err(), "a trusted name is never silently re-keyed");
         assert!(trust.untrust("io.macula"));
         trust.trust("io.macula", &other_key, &fingerprint(&other_key)).expect("after untrust, a new key is a fresh decision");
+    }
+
+    /// Fable round 1, required 1: the name is bound as well as the key. A
+    /// descriptor whose own `realm` is consistent (anyone can hash a name)
+    /// but not the realm the person meant to trust is refused.
+    #[test]
+    fn a_descriptor_is_trusted_only_under_the_name_the_person_meant() {
+        let text = include_str!("../../tests/vectors/io.macula.well-known.json");
+        let fp = fingerprint(&io_macula().1);
+        let mut trust = RealmTrust::default();
+        let err = trust.trust_descriptor("net.beam-campus", text, &fp).err().expect("a descriptor for another name");
+        assert!(err.contains("io.macula"), "{err}");
+        assert!(trust.entry("net.beam-campus").is_none() && trust.entry("io.macula").is_none(), "nothing trusted");
+        let entry = trust.trust_descriptor("io.macula", text, &fp).expect("the name meant");
+        assert_eq!(entry.key_id, fp);
+        assert_eq!(trust.entry(" io.macula ").map(|e| e.key_id.clone()), Some(fp));
     }
 
     #[test]
