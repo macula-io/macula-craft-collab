@@ -144,6 +144,8 @@ mod tests {
             expires_ms: 61_000,
             token: Some(token),
             member_role: None,
+            member_realm: None,
+            host_realm: None,
             invitee: None,
             invitee_name: None,
             signature: Vec::new(),

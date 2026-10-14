@@ -8,6 +8,7 @@
 
 pub mod proof;
 pub mod session;
+pub mod trust;
 
 use std::path::PathBuf;
 
@@ -178,13 +179,13 @@ fn secure_dir(dir: &std::path::Path) {
 fn secure_dir(_dir: &std::path::Path) {}
 
 #[cfg(unix)]
-fn secure_file(path: &std::path::Path) {
+pub(crate) fn secure_file(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt as _;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
 #[cfg(not(unix))]
-fn secure_file(_path: &std::path::Path) {}
+pub(crate) fn secure_file(_path: &std::path::Path) {}
 
 /// Which realm the silent device-tier auto-join targets, when the feature
 /// is on (`MACULA_CRAFT_AUTOJOIN_REALM`, e.g. `io.macula`). Unset means the
@@ -291,6 +292,10 @@ impl craft_collab::MembershipVerifier for RealmMemberVerifier {
 
     fn role(&self) -> craft_collab::Role {
         self.role
+    }
+
+    fn realm(&self) -> &str {
+        &self.realm
     }
 }
 
