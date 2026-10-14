@@ -23,7 +23,7 @@ workspace = true
 
 [dependencies]
 # the shared seam (spike branch of the craft-libs fork)
-craft-collab = { path = "../../rgfaber/craft-libs/crates/collab" }
+craft-collab = { path = "../../rgfaber/craft-libs/crates/collab", package = "macula-craft-seam", version = "0.1" }
 # released crates only
 macula-rust = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

@@ -468,15 +468,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "craft-collab"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "yrs",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1017,10 +1008,10 @@ name = "macula-craft-collab"
 version = "0.1.0"
 dependencies = [
  "base64",
- "craft-collab",
  "getrandom 0.2.17",
  "hex",
  "keyring",
+ "macula-craft-seam",
  "macula-mldsa",
  "macula-rust",
  "minreq",
@@ -1029,6 +1020,15 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "macula-craft-seam"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "yrs",
 ]
 
 [[package]]
