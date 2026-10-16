@@ -225,14 +225,8 @@ async fn run(
         match out {
             Outbound::DeviceJoin { realm_name, reply } => {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-                let outcome = match realm::join_device(&pool, &identity, &realm_name, now).await {
-                    Ok(cred) => match realm::store_credential(&cred) {
-                        Ok(_) => Ok(cred),
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
-                };
-                let _ = reply.send(outcome);
+                // Through the renewal path, so a person's stored fields stay.
+                let _ = reply.send(realm::renew_membership(&pool, &identity, &realm_name, now).await);
             }
             Outbound::Publish(topic, json) => {
                 let payload = Value::Map(vec![(Value::text("json"), Value::text(json))]);

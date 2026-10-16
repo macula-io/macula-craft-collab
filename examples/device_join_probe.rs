@@ -41,16 +41,13 @@ fn main() {
         opts.realm_trust.insert(realm::realm_id_of(&realm_name), realm_key.clone());
         let pool = Pool::connect(vec![Seed { host, port, node_id: station }], opts).await.expect("connect");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-        match realm::join_device(&pool, &identity, &realm_name, now).await {
+        match realm::renew_membership(&pool, &identity, &realm_name, now).await {
             Ok(cred) => {
                 println!("tier: {:?}", cred.tier);
                 println!("org: {}", cred.org_identity);
                 println!("citizen_did: {}...", &cred.node_id[..8.min(cred.node_id.len())]);
                 println!("ucan: {} bytes, expires {:?}", cred.ucan.as_deref().map(str::len).unwrap_or(0), cred.ucan_expires_ms());
-                match realm::store_credential(&cred) {
-                    Ok(path) => println!("stored: {}", path.display()),
-                    Err(e) => println!("store failed: {e}"),
-                }
+                println!("stored beside the identity keys");
                 // The host-side check, against the realm's own key: the live
                 // UCAN must verify for THIS node and no one else.
                 let now_s = (now / 1_000) as i64;
