@@ -25,7 +25,9 @@ use crate::identity::Identity;
 
 /// Which path bound this node to the realm: the silent device-tier proof, or
 /// a person through the realm's join session. A citizen credential is
-/// strictly stronger; nothing ever downgrades one to a device credential.
+/// strictly stronger. A renewal takes the tier from the token the realm
+/// mints, and the realm mints from the member's own record, so a renewal
+/// never downgrades a person (macula-realm#46).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
@@ -199,8 +201,14 @@ pub fn auto_join_realm() -> Option<String> {
 pub const MEMBER_DEVICE_CAN: &str = "member/device-verified";
 pub const MEMBER_CITIZEN_CAN: &str = "member/email-verified";
 
-/// How close to expiry a device-tier membership is re-minted, on connect.
-pub const RENEW_MARGIN_MS: u64 = 30 * 60 * 1_000;
+/// How close to expiry a membership is re-minted. The realm mints for 1 hour
+/// at most (its revocation bound, macula-realm#46), so a membership renews
+/// at the first check after its mint, about every 10 minutes, and a realm
+/// restart leaves several retries before the token runs out.
+pub const RENEW_MARGIN_MS: u64 = 50 * 60 * 1_000;
+
+/// How often the renewal loop checks, before its jitter.
+pub const RENEW_CHECK_MS: u64 = 10 * 60 * 1_000;
 
 /// Verifies a membership UCAN the way a host does when a peer presents it:
 /// issued by the realm's own key, audience = the verified caller (exactly
@@ -243,32 +251,85 @@ fn capability_covers(claims: &serde_json::Map<String, serde_json::Value>, realm_
     caps.iter().any(|entry| entry.get("with").and_then(|v| v.as_str()) == Some(realm_with) && entry.get("can").and_then(|v| v.as_str()) == Some(can))
 }
 
-/// Whether this credential's membership should be re-minted. A citizen
-/// credential is a person's binding and is never silently re-minted (its
-/// renewal is the portal's session); a device credential is re-minted when
-/// its UCAN is missing or inside the renewal margin.
+/// Whether this credential's membership should be re-minted: its UCAN is
+/// missing or inside the renewal margin. Both tiers renew; the realm answers
+/// a person's node with the person's tier.
 pub fn needs_renewal(cred: &RealmCredential, now_ms: u64) -> bool {
-    match cred.tier {
-        Tier::Citizen => false,
-        Tier::Device => match cred.ucan_expires_ms() {
-            None => true,
-            Some(expires) => expires <= now_ms.saturating_add(RENEW_MARGIN_MS),
-        },
+    match cred.ucan_expires_ms() {
+        None => true,
+        Some(expires) => expires <= now_ms.saturating_add(RENEW_MARGIN_MS),
     }
 }
 
-/// Re-mints a device-tier membership (a fresh proof, the realm's newest
-/// UCAN) and stores it. A citizen credential is returned untouched: a
-/// silent re-mint must never downgrade a person's binding.
-pub async fn renew_membership(pool: &Pool, identity: &Identity, realm_name: &str, now_ms: u64) -> Result<RealmCredential, String> {
-    if let Some(cred) = load_credential(identity.node_id(), realm_name)
-        && cred.tier == Tier::Citizen
-    {
-        return Ok(cred);
+/// The tier a membership UCAN grants: a person's (`member/email-verified`)
+/// or a device's. Reads, never verifies. Pure.
+pub fn tier_of(ucan: &str) -> Tier {
+    use base64::Engine as _;
+    let claims = ucan
+        .split('.')
+        .nth(1)
+        .and_then(|payload| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let citizen = claims
+        .as_ref()
+        .and_then(|c| c.get("cap"))
+        .and_then(|cap| cap.as_array())
+        .is_some_and(|caps| caps.iter().any(|entry| entry.get("can").and_then(|v| v.as_str()) == Some(MEMBER_CITIZEN_CAN)));
+    if citizen { Tier::Citizen } else { Tier::Device }
+}
+
+/// What a renewal leaves: the stored credential with the fresh token, its
+/// echoed node id and the tier it grants; the person's fields (org identity
+/// and handle, account, cert, refresh token, join time, portal) stay. With
+/// nothing stored, the fresh credential. Pure.
+pub fn renewed_credential(stored: Option<RealmCredential>, fresh: RealmCredential) -> RealmCredential {
+    match stored {
+        None => fresh,
+        Some(stored) => RealmCredential { citizen_did: fresh.citizen_did, ucan: fresh.ucan, tier: fresh.tier, ..stored },
     }
-    let cred = join_device(pool, identity, realm_name, now_ms).await?;
+}
+
+/// Re-mints this node's membership (a fresh proof, the realm's newest UCAN)
+/// and stores it, keeping the person's fields. A refusal (the membership
+/// ended) keeps the stored credential, which then expires, and is returned.
+pub async fn renew_membership(pool: &Pool, identity: &Identity, realm_name: &str, now_ms: u64) -> Result<RealmCredential, String> {
+    let fresh = join_device(pool, identity, realm_name, now_ms).await?;
+    let cred = renewed_credential(load_credential(identity.node_id(), realm_name), fresh);
     store_credential(&cred)?;
     Ok(cred)
+}
+
+/// Keeps this node's membership of `realm_id` renewed while the transport
+/// runs: the silent auto-join first (when opted in), then every
+/// [`RENEW_CHECK_MS`] (plus up to a minute of jitter) every stored
+/// membership of that realm inside the margin is renewed, and `current`
+/// is set to its token, which the session presents to have its document
+/// grant extended. Only `realm_id` is renewed: the transport resolves calls
+/// under that realm's pinned key alone. Never fails; a failure is logged.
+pub async fn keep_memberships_renewed(pool: Pool, identity: Identity, realm_id: [u8; 32], current: std::sync::Arc<std::sync::Mutex<Option<String>>>) {
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    ensure_auto_join(&pool, &identity, now()).await;
+    loop {
+        for held in list_credentials(identity.node_id()).into_iter().filter(|c| realm_id_of(&c.realm) == realm_id) {
+            let ucan = if needs_renewal(&held, now()) {
+                match renew_membership(&pool, &identity, &held.realm, now()).await {
+                    Ok(renewed) => renewed.ucan,
+                    Err(e) => {
+                        log_stderr(&format!("realm renewal of {} in {} failed: {e}", identity.node_id(), held.realm));
+                        held.ucan
+                    }
+                }
+            } else {
+                held.ucan
+            };
+            if let Ok(mut slot) = current.lock() {
+                *slot = ucan;
+            }
+        }
+        let mut jitter = [0u8; 2];
+        let jitter_ms = getrandom::getrandom(&mut jitter).map(|()| u64::from(u16::from_le_bytes(jitter)) % 60_000).unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(RENEW_CHECK_MS + jitter_ms)).await;
+    }
 }
 
 /// The seam's membership verifier over a realm's UCANs: what a host runs
@@ -370,15 +431,15 @@ pub async fn join_device(pool: &Pool, identity: &Identity, realm_name: &str, now
         refresh_token: String::new(),
         joined_at_ms: now_ms,
         citizen_did: Some(citizen_did),
+        tier: tier_of(&ucan),
         ucan: Some(ucan),
-        tier: Tier::Device,
     })
 }
 
 /// The idempotent, non-fatal entry point, called on connect: no-op when the
-/// feature is off or this node already holds ANY credential for the realm
-/// (never downgrade or duplicate); a failure is logged and never takes the
-/// connection down.
+/// feature is off or this node already holds a credential for the realm
+/// with time to run; otherwise it joins or renews, keeping a person's
+/// fields. A failure is logged and never takes the connection down.
 pub async fn ensure_auto_join(pool: &Pool, identity: &Identity, now_ms: u64) {
     let Some(realm_name) = auto_join_realm() else {
         return;
@@ -388,13 +449,8 @@ pub async fn ensure_auto_join(pool: &Pool, identity: &Identity, now_ms: u64) {
     {
         return;
     }
-    match join_device(pool, identity, &realm_name, now_ms).await {
-        Ok(cred) => {
-            if let Err(e) = store_credential(&cred) {
-                log_stderr(&format!("realm auto-join: storing the credential failed: {e}"));
-            }
-        }
-        Err(e) => log_stderr(&format!("realm auto-join of {} against {realm_name} failed: {e}", identity.node_id())),
+    if let Err(e) = renew_membership(pool, identity, &realm_name, now_ms).await {
+        log_stderr(&format!("realm auto-join of {} against {realm_name} failed: {e}", identity.node_id()));
     }
 }
 
@@ -513,7 +569,56 @@ mod tests {
         assert!(!needs_renewal(&cred(Tier::Device, Some(fake_ucan(now / 1000 + 4 * 3600))), now), "a fresh device UCAN is left alone");
         assert!(needs_renewal(&cred(Tier::Device, Some(fake_ucan(now / 1000 + 600))), now), "inside the margin it renews");
         assert!(needs_renewal(&cred(Tier::Device, None), now), "a device credential without a UCAN renews");
-        assert!(!needs_renewal(&cred(Tier::Citizen, Some(fake_ucan(now / 1000 + 60))), now), "a person's binding is never silently re-minted");
+        // macula-realm#46 step 3: the realm mints for 1 hour; a person's
+        // membership renews too (the realm returns the person's own tier).
+        assert!(needs_renewal(&cred(Tier::Citizen, Some(fake_ucan(now / 1000 + 60))), now), "a person's membership renews too");
+        assert!(needs_renewal(&cred(Tier::Device, Some(fake_ucan(now / 1000 + 3600 - 11 * 60))), now), "a 1 hour token renews 11 minutes in");
+        assert!(!needs_renewal(&cred(Tier::Citizen, Some(fake_ucan(now / 1000 + 3600 - 60))), now), "a token minted a minute ago is left alone");
+    }
+
+    #[test]
+    fn a_renewal_takes_the_tier_from_the_token_and_keeps_the_persons_fields() {
+        use base64::Engine as _;
+        let ucan_with = |can: &str| {
+            let payload = serde_json::json!({"exp": 1, "cap": [{"with": "mri:realm:io.macula", "can": can}]}).to_string();
+            format!("h.{}.s", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
+        };
+        assert_eq!(tier_of(&ucan_with(MEMBER_CITIZEN_CAN)), Tier::Citizen);
+        assert_eq!(tier_of(&ucan_with(MEMBER_DEVICE_CAN)), Tier::Device);
+        assert_eq!(tier_of("not-a-token"), Tier::Device);
+
+        let stored = RealmCredential {
+            node_id: "0011".into(),
+            realm: "io.macula".into(),
+            portal: "https://realm.example".into(),
+            org_identity: "mri:org:io.macula/ada".into(),
+            account: Some("ada@example.com".into()),
+            cert_pem: Some("PEM".into()),
+            refresh_token: "rt".into(),
+            joined_at_ms: 1_000,
+            citizen_did: Some("0011".into()),
+            ucan: Some("old".into()),
+            tier: Tier::Citizen,
+        };
+        let fresh = RealmCredential {
+            portal: "io.macula".into(),
+            org_identity: "mri:org:io.macula".into(),
+            account: None,
+            cert_pem: None,
+            refresh_token: String::new(),
+            joined_at_ms: 9_000,
+            ucan: Some(ucan_with(MEMBER_CITIZEN_CAN)),
+            ..stored.clone()
+        };
+        let renewed = renewed_credential(Some(stored.clone()), fresh.clone());
+        assert_eq!(renewed.ucan, fresh.ucan, "the new token");
+        assert_eq!(renewed.tier, Tier::Citizen, "the tier the token grants");
+        assert_eq!(
+            (renewed.org_identity.as_str(), renewed.account.as_deref(), renewed.cert_pem.as_deref()),
+            ("mri:org:io.macula/ada", Some("ada@example.com"), Some("PEM"))
+        );
+        assert_eq!((renewed.portal.as_str(), renewed.refresh_token.as_str(), renewed.joined_at_ms), ("https://realm.example", "rt", 1_000));
+        assert_eq!(renewed_credential(None, fresh.clone()), fresh, "with nothing stored, the fresh one");
     }
 
     #[test]

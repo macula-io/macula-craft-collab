@@ -70,6 +70,9 @@ pub struct MeshTransport {
     /// Messages dropped because their claimed author was not the verified
     /// publisher (a forged envelope author).
     dropped_unverified: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// This node's current membership UCAN of the transport's realm, kept
+    /// renewed by the mesh thread (macula-realm#46).
+    membership: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MeshTransport {
@@ -104,6 +107,8 @@ impl MeshTransport {
         let identity = identity.clone();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let dropped_in_thread = dropped.clone();
+        let membership = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let membership_in_thread = membership.clone();
         std::thread::Builder::new()
             .name("macula-craft-collab".into())
             .spawn(move || {
@@ -114,11 +119,11 @@ impl MeshTransport {
                         return;
                     }
                 };
-                rt.block_on(run(cfg, key, identity, in_tx, ready_tx, dropped_in_thread));
+                rt.block_on(run(cfg, key, identity, in_tx, ready_tx, dropped_in_thread, membership_in_thread));
             })
             .map_err(|e| format!("thread: {e}"))?;
         match ready_rx.recv() {
-            Ok(Ok(out)) => Ok(MeshTransport { author, out, incoming: in_rx, dropped_unverified: dropped }),
+            Ok(Ok(out)) => Ok(MeshTransport { author, out, incoming: in_rx, dropped_unverified: dropped, membership }),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("the mesh thread ended before it was ready: {e}")),
         }
@@ -148,6 +153,7 @@ async fn run(
     in_tx: Sender<Message>,
     ready: std::sync::mpsc::Sender<Result<UnboundedSender<Outbound>, String>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    membership: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let mut opts = Opts::new(key);
     // Pubsub needs no realm trust: it is only consulted when a call resolves
@@ -164,20 +170,18 @@ async fn run(
         }
     };
 
-    // The silent device-tier realm membership, at first connect: opt-in
-    // (MACULA_CRAFT_AUTOJOIN_REALM) and only when a realm key is pinned
-    // (a call can only be resolved under it). Non-fatal by design.
+    // The realm membership, kept renewed while the transport runs: the
+    // silent device-tier join at first connect (opt-in,
+    // MACULA_CRAFT_AUTOJOIN_REALM), then every stored membership of this
+    // realm renewed before its 1 hour token runs out (macula-realm#46). Only
+    // when a realm key is pinned: a call can only be resolved under it.
+    // Non-fatal by design.
     if cfg.realm_key.is_empty() {
         if realm::auto_join_realm().is_some() {
             eprintln!("realm auto-join: no realm key pinned in this config; skipping (calls need the trust anchor)");
         }
     } else {
-        let pool_for_join = pool.clone();
-        let identity_for_join = identity.clone();
-        tokio::spawn(async move {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-            realm::ensure_auto_join(&pool_for_join, &identity_for_join, now).await;
-        });
+        tokio::spawn(realm::keep_memberships_renewed(pool.clone(), identity.clone(), cfg.realm_id, membership));
     }
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
@@ -252,6 +256,10 @@ impl Transport for MeshTransport {
 
     fn poll(&mut self) -> Vec<Message> {
         self.incoming.try_iter().collect()
+    }
+
+    fn membership(&self) -> Option<String> {
+        self.membership.lock().ok()?.clone()
     }
 }
 
