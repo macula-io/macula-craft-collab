@@ -1005,7 +1005,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "macula-craft-collab"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
@@ -1025,9 +1025,9 @@ dependencies = [
 
 [[package]]
 name = "macula-craft-seam"
-version = "0.5.2"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f18843e4cc5ff823b03769cd6be4a64b30204e0bc291d519ce209ca2e9e30122"
+checksum = "a706331b2649bcb10616bed05d93c1f12542dd6a13d80593021051b2b67cfc58"
 dependencies = [
  "serde",
  "serde_json",
@@ -1089,9 +1089,9 @@ dependencies = [
 
 [[package]]
 name = "macula-rust"
-version = "0.9.3"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7a4f4fd980841ca379b4052d0166f6344389621d0390f904aa0515a6b39de45"
+checksum = "03de8bac0ffe88738b150106e5f071e5c76c9820a25d636a57c4f7c9cb2eee32"
 dependencies = [
  "apple-native-keyring-store",
  "aws-lc-rs",

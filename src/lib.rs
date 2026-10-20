@@ -27,6 +27,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use craft_collab::{Kind, Message, Transport};
 use macula_rust::cbor::Value;
+use macula_rust::frame::Payload;
 use macula_rust::node_key::NodeKey;
 use macula_rust::pool::{Opts, Pool, Seed};
 use macula_rust::station_link::Publication;
@@ -198,10 +199,21 @@ async fn run(
                 // must be exactly this, or the message is a forgery and is
                 // dropped, never trusted.
                 let publisher: String = event.publisher.iter().map(|b| format!("{b:02x}")).collect();
-                let json = event.payload.get("json").and_then(|v| match v {
-                    Value::Text(t) => Some(t.clone()),
-                    _ => None,
-                });
+                // Craft topics travel in the clear. A sealed group event under
+                // one of them is someone else's traffic, not a document
+                // message, and `Pool::subscribe` hands it over already
+                // unopened: its payload is a null value and `unopened` names
+                // the reason, so there is no `json` field to read.
+                let json = match &event.payload {
+                    Payload::Clear(value) => value.get("json").and_then(|v| match v {
+                        Value::Text(t) => Some(t.clone()),
+                        _ => None,
+                    }),
+                    // Not the shape a pool subscription delivers, which marks
+                    // a sealed event unopened and clears its payload; matched
+                    // so the payload is read whole.
+                    Payload::Sealed(_) => None,
+                };
                 if let Some(json) = json {
                     match verified_message(&json, &publisher) {
                         Some(msg) => {
@@ -230,7 +242,7 @@ async fn run(
             }
             Outbound::Publish(topic, json) => {
                 let payload = Value::Map(vec![(Value::text("json"), Value::text(json))]);
-                let _ = pool.publish(Publication { realm, topic: topic.to_string(), payload, ttl_ms: None }).await;
+                let _ = pool.publish(Publication { realm, topic: topic.to_string(), payload: Payload::Clear(payload), ttl_ms: None }).await;
             }
         }
     }
