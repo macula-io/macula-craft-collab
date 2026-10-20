@@ -1,0 +1,60 @@
+name: ci
+
+# Formatting, clippy and tests on every push to a branch and every pull request.
+#
+# THIS REPOSITORY HAD NO TEST CI. Its only workflow was release.yml, which
+# runs on a v* tag and publishes the crate. Nothing ran when code was pushed to
+# master, so a regression could reach a release tag without a test having run
+# on the commit it was cut from.
+#
+# Modeled on macula-io/macula-slab's ci.yml, which is this org's standard for a
+# crate on its own: `cargo fmt --all --check` as its own job, then a stable
+# toolchain run. --locked here, because this crate ships a committed Cargo.lock
+# and the release builds from it.
+#
+# `branches: ['**']` IS LOAD-BEARING: a push event fires for tag refs too, and
+# `**` matches every branch while excluding tags, so this does not run a second
+# time beside release.yml on every release.
+
+on:
+  push:
+    branches: ['**']
+    paths-ignore: ['**.md']
+  pull_request:
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: -Dwarnings
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  check:
+    name: clippy + test (stable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
