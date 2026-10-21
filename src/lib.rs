@@ -29,8 +29,8 @@ use craft_collab::{Kind, Message, Transport};
 use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
 use macula_rust::node_key::NodeKey;
-use macula_rust::pool::{Opts, Pool, Seed};
-use macula_rust::station_link::Publication;
+use macula_rust::pool::{Opts, Pool, Seed, Subscription};
+use macula_rust::station_link::{Event, Publication};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Where text edits travel.
@@ -113,14 +113,7 @@ impl MeshTransport {
         std::thread::Builder::new()
             .name("macula-craft-collab".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(format!("runtime: {e}")));
-                        return;
-                    }
-                };
-                rt.block_on(run(cfg, key, identity, in_tx, ready_tx, dropped_in_thread, membership_in_thread));
+                run_on_new_runtime(cfg, key, identity, in_tx, ready_tx, dropped_in_thread, membership_in_thread);
             })
             .map_err(|e| format!("thread: {e}"))?;
         match ready_rx.recv() {
@@ -143,6 +136,27 @@ impl MeshTransport {
             .map_err(|_| "the mesh transport is closed".to_string())?;
         rx.recv().map_err(|_| "the mesh transport ended before the join answered".to_string())?
     }
+}
+
+/// Builds the mesh thread's runtime and runs the transport loop on it. A
+/// runtime that cannot be built is reported where a failed connect is.
+fn run_on_new_runtime(
+    cfg: MeshConfig,
+    key: Arc<NodeKey>,
+    identity: Identity,
+    in_tx: Sender<Message>,
+    ready: std::sync::mpsc::Sender<Result<UnboundedSender<Outbound>, String>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    membership: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = ready.send(Err(format!("runtime: {e}")));
+            return;
+        }
+    };
+    rt.block_on(run(cfg, key, identity, in_tx, ready, dropped, membership));
 }
 
 /// Runs until the transport is dropped: then the outbound channel closes,
@@ -187,47 +201,13 @@ async fn run(
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
     for topic in [TOPIC_TEXT, TOPIC_CURSOR, TOPIC_SHARED, TOPIC_COMMAND, TOPIC_JOIN, TOPIC_GRANT, TOPIC_REVOKE] {
-        let Ok(mut sub) = pool.subscribe(&cfg.realm_id, topic).await else {
+        let Ok(sub) = pool.subscribe(&cfg.realm_id, topic).await else {
             let _ = ready.send(Err(format!("subscribe {topic}")));
             return;
         };
         let tx = in_tx.clone();
         let dropped = dropped.clone();
-        tokio::spawn(async move {
-            while let Some(event) = sub.recv().await {
-                // The publication's verified publisher: the envelope author
-                // must be exactly this, or the message is a forgery and is
-                // dropped, never trusted.
-                let publisher: String = event.publisher.iter().map(|b| format!("{b:02x}")).collect();
-                // Craft topics travel in the clear. A sealed group event under
-                // one of them is someone else's traffic, not a document
-                // message, and `Pool::subscribe` hands it over already
-                // unopened: its payload is a null value and `unopened` names
-                // the reason, so there is no `json` field to read.
-                let json = match &event.payload {
-                    Payload::Clear(value) => value.get("json").and_then(|v| match v {
-                        Value::Text(t) => Some(t.clone()),
-                        _ => None,
-                    }),
-                    // Not the shape a pool subscription delivers, which marks
-                    // a sealed event unopened and clears its payload; matched
-                    // so the payload is read whole.
-                    Payload::Sealed(_) => None,
-                };
-                if let Some(json) = json {
-                    match verified_message(&json, &publisher) {
-                        Some(msg) => {
-                            if tx.send(msg).is_err() {
-                                break;
-                            }
-                        }
-                        None => {
-                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-        });
+        tokio::spawn(pump_events(sub, tx, dropped));
     }
     // The transport holds the only sender; when it drops, the channel ends.
     let _ = ready.send(Ok(out_tx));
@@ -247,6 +227,50 @@ async fn run(
         }
     }
     pool.close().await;
+}
+
+/// Feeds a subscription's events to the transport until the transport drops
+/// its receiving end or the subscription ends.
+async fn pump_events(mut sub: Subscription, tx: Sender<Message>, dropped: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    while let Some(event) = sub.recv().await {
+        if !deliver_event(&event, &tx, &dropped) {
+            break;
+        }
+    }
+}
+
+/// Hands one delivered event to the transport as a message, or counts it as a
+/// forged envelope author; false when the receiving end has closed.
+fn deliver_event(event: &Event, tx: &Sender<Message>, dropped: &std::sync::atomic::AtomicU64) -> bool {
+    // The publication's verified publisher: the envelope author
+    // must be exactly this, or the message is a forgery and is
+    // dropped, never trusted.
+    let publisher: String = event.publisher.iter().map(|b| format!("{b:02x}")).collect();
+    // Craft topics travel in the clear. A sealed group event under
+    // one of them is someone else's traffic, not a document
+    // message, and `Pool::subscribe` hands it over already
+    // unopened: its payload is a null value and `unopened` names
+    // the reason, so there is no `json` field to read.
+    let json = match &event.payload {
+        Payload::Clear(value) => value.get("json").and_then(|v| match v {
+            Value::Text(t) => Some(t.clone()),
+            _ => None,
+        }),
+        // Not the shape a pool subscription delivers, which marks
+        // a sealed event unopened and clears its payload; matched
+        // so the payload is read whole.
+        Payload::Sealed(_) => None,
+    };
+    let Some(json) = json else {
+        return true;
+    };
+    match verified_message(&json, &publisher) {
+        Some(msg) => tx.send(msg).is_ok(),
+        None => {
+            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+    }
 }
 
 impl Transport for MeshTransport {

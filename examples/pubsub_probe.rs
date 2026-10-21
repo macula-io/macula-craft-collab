@@ -66,11 +66,9 @@ fn main() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut heard = 0;
     while Instant::now() < deadline {
-        for m in mesh.poll() {
-            if m.author != author {
-                heard += 1;
-                println!("{label}: HEARD from {}: {:?}", &m.author[..8], m.kind);
-            }
+        for m in mesh.poll().into_iter().filter(|m| m.author != author) {
+            heard += 1;
+            println!("{label}: HEARD from {}: {:?}", &m.author[..8], m.kind);
         }
         std::thread::sleep(Duration::from_millis(200));
     }

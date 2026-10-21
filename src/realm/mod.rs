@@ -311,24 +311,35 @@ pub async fn keep_memberships_renewed(pool: Pool, identity: Identity, realm_id: 
     ensure_auto_join(&pool, &identity, now()).await;
     loop {
         for held in list_credentials(identity.node_id()).into_iter().filter(|c| realm_id_of(&c.realm) == realm_id) {
-            let ucan = if needs_renewal(&held, now()) {
-                match renew_membership(&pool, &identity, &held.realm, now()).await {
-                    Ok(renewed) => renewed.ucan,
-                    Err(e) => {
-                        log_stderr(&format!("realm renewal of {} in {} failed: {e}", identity.node_id(), held.realm));
-                        held.ucan
-                    }
-                }
-            } else {
-                held.ucan
-            };
-            if let Ok(mut slot) = current.lock() {
-                *slot = ucan;
-            }
+            renew_one(&pool, &identity, &held, &current, now()).await;
         }
         let mut jitter = [0u8; 2];
         let jitter_ms = getrandom::getrandom(&mut jitter).map(|()| u64::from(u16::from_le_bytes(jitter)) % 60_000).unwrap_or(0);
         tokio::time::sleep(std::time::Duration::from_millis(RENEW_CHECK_MS + jitter_ms)).await;
+    }
+}
+
+/// Renews one held membership when it is inside the renewal margin and
+/// publishes its token where the session reads it.
+async fn renew_one(pool: &Pool, identity: &Identity, held: &RealmCredential, current: &std::sync::Mutex<Option<String>>, now_ms: u64) {
+    let ucan = renewed_or_held(pool, identity, held, now_ms).await;
+    if let Ok(mut slot) = current.lock() {
+        *slot = ucan;
+    }
+}
+
+/// The token a held credential presents after a renewal check: a fresh one,
+/// or the held one when the realm refused (logged), which then expires.
+async fn renewed_or_held(pool: &Pool, identity: &Identity, held: &RealmCredential, now_ms: u64) -> Option<String> {
+    if !needs_renewal(held, now_ms) {
+        return held.ucan.clone();
+    }
+    match renew_membership(pool, identity, &held.realm, now_ms).await {
+        Ok(renewed) => renewed.ucan,
+        Err(e) => {
+            log_stderr(&format!("realm renewal of {} in {} failed: {e}", identity.node_id(), held.realm));
+            held.ucan.clone()
+        }
     }
 }
 

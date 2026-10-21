@@ -2,3 +2,10 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+
+# The structural floor (macula-codebase-checks#9): a function that nests
+# past three blocks, goes past cognitive complexity 15 or runs past 60 lines
+# fails the clippy step in CI.
+excessive-nesting-threshold = 3
+cognitive-complexity-threshold = 15
+too-many-lines-threshold = 60

@@ -187,28 +187,8 @@ impl Identity {
                 })?
             }
             Some(Backend::File) => file_identity(dir, slug, profile)?,
-            None => {
-                // First load here: pick the backend that works and record it.
-                match store {
-                    Some(store) => match keyring_identity(store, profile) {
-                        Ok(key) => {
-                            meta.backend = Some(Backend::Keyring);
-                            key
-                        }
-                        Err(StorePick::Unavailable(_)) => {
-                            let key = file_identity(dir, slug, profile)?;
-                            meta.backend = Some(Backend::File);
-                            key
-                        }
-                        Err(StorePick::Refused(why)) => return Err(why),
-                    },
-                    None => {
-                        let key = file_identity(dir, slug, profile)?;
-                        meta.backend = Some(Backend::File);
-                        key
-                    }
-                }
-            }
+            // First load here: pick the backend that works and record it.
+            None => pick_identity_key(store, dir, slug, profile, &mut meta)?,
         };
 
         let node_id = key.node_id().map_err(|e| format!("key: {e:?}"))?;
@@ -252,6 +232,30 @@ fn keyring_identity(store: &dyn KeyStore, profile: Profile) -> Result<NodeKey, S
         }
         Err(KeyFileError::KeyStore(KeyStoreError::Backend(e))) => Err(StorePick::Unavailable(e.to_string())),
         Err(e) => Err(StorePick::Refused(format!("the stored key does not load: {e}"))),
+    }
+}
+
+/// The key for an identity with no backend recorded yet: the secure store
+/// when it works, the file fallback when there is no store or it cannot save,
+/// recording the backend that answered. A store holding something that is not
+/// this identity is an error, never a replacement.
+fn pick_identity_key(store: Option<&dyn KeyStore>, dir: Option<&Path>, slug: &str, profile: Profile, meta: &mut Meta) -> Result<NodeKey, String> {
+    let Some(store) = store else {
+        let key = file_identity(dir, slug, profile)?;
+        meta.backend = Some(Backend::File);
+        return Ok(key);
+    };
+    match keyring_identity(store, profile) {
+        Ok(key) => {
+            meta.backend = Some(Backend::Keyring);
+            Ok(key)
+        }
+        Err(StorePick::Unavailable(_)) => {
+            let key = file_identity(dir, slug, profile)?;
+            meta.backend = Some(Backend::File);
+            Ok(key)
+        }
+        Err(StorePick::Refused(why)) => Err(why),
     }
 }
 
@@ -355,22 +359,23 @@ mod tests {
         fn backend_error() -> KeyStoreError {
             KeyStoreError::Backend(keyring::Error::NoEntry)
         }
+        /// A backend failure when this store is the broken one: the check each
+        /// load and save starts with.
+        fn usable(&self) -> Result<(), KeyStoreError> {
+            (!self.broken).then_some(()).ok_or_else(Self::backend_error)
+        }
     }
 
     impl KeyStore for MemStore {
         fn save_key(&self, key: &[u8]) -> Result<(), KeyStoreError> {
-            if self.broken {
-                return Err(Self::backend_error());
-            }
+            self.usable()?;
             let mut keys = self.keys.lock().map_err(|_| Self::backend_error())?;
             keys.insert("k".into(), key.to_vec());
             Ok(())
         }
 
         fn load_key(&self) -> Result<Zeroizing<Vec<u8>>, KeyStoreError> {
-            if self.broken {
-                return Err(Self::backend_error());
-            }
+            self.usable()?;
             let keys = self.keys.lock().map_err(|_| Self::backend_error())?;
             match keys.get("k") {
                 Some(k) => Ok(Zeroizing::new(k.clone())),

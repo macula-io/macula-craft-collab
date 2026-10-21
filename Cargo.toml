@@ -9,6 +9,10 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 dbg_macro = "warn"
 todo = "warn"
+# The structural floor: clippy.toml holds the thresholds these measure.
+excessive_nesting = "deny"
+cognitive_complexity = "deny"
+too_many_lines = "deny"
 
 [package]
 name = "macula-craft-collab"

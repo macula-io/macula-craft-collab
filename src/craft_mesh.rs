@@ -317,17 +317,23 @@ pub fn share_verifier(
     let is_transport_realm = hex_bytes(transport_realm_id).is_ok_and(|id| id == crate::realm::realm_id_of(realm));
     if is_transport_realm && !transport_realm_key.is_empty() {
         let key = hex_bytes(transport_realm_key)?;
-        // A checked trust entry for the same realm outranks an unchecked
-        // config key: they must agree, or nothing is shared.
-        if let Some(entry) = trust.entry(realm) {
-            let pinned = crate::realm::trust::fingerprint(&key);
-            if pinned != entry.key_id {
-                return Err(format!("{realm}: the config's key ({pinned}) is not the one you trusted ({}); fix one of them", entry.key_id));
-            }
-        }
+        config_key_agrees_with_trust(&trust, realm, &key)?;
         return Ok(RealmMemberVerifier::new(realm, key, role));
     }
     trust.verifier(realm, role)
+}
+
+/// A checked trust entry for the same realm outranks an unchecked config key:
+/// they must agree, or nothing is shared.
+fn config_key_agrees_with_trust(trust: &RealmTrust, realm: &str, key: &[u8]) -> Result<(), String> {
+    let Some(entry) = trust.entry(realm) else {
+        return Ok(());
+    };
+    let pinned = crate::realm::trust::fingerprint(key);
+    if pinned == entry.key_id {
+        return Ok(());
+    }
+    Err(format!("{realm}: the config's key ({pinned}) is not the one you trusted ({}); fix one of them", entry.key_id))
 }
 
 fn join_line(identity: &Identity, name: &str, line: &str) -> Result<CollabSession, String> {

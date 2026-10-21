@@ -222,21 +222,27 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let seen = log.clone();
         let realm_id = crate::realm::realm_id_of(realm_name);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let Some(request) = read_request(&mut stream) else {
-                    continue;
-                };
-                let (status, body) = handle(&request, &realm_id, &public_key, &seen);
-                let reply = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(reply.as_bytes());
-            }
-        });
+        std::thread::spawn(move || serve_connections(listener, realm_id, public_key, seen));
         (format!("http://{addr}"), log)
+    }
+
+    /// Answers every connection the mock realm accepts, until the listener
+    /// closes or accepting one fails.
+    fn serve_connections(listener: TcpListener, realm_id: [u8; 32], public_key: Vec<u8>, seen: Arc<Mutex<Vec<String>>>) {
+        for mut stream in listener.incoming().map_while(Result::ok) {
+            serve_connection(&mut stream, &realm_id, &public_key, &seen);
+        }
+    }
+
+    /// Reads one request and writes its answer.
+    fn serve_connection(stream: &mut std::net::TcpStream, realm_id: &[u8; 32], public_key: &[u8], seen: &Arc<Mutex<Vec<String>>>) {
+        let Some(request) = read_request(stream) else {
+            return;
+        };
+        let (status, body) = handle(&request, realm_id, public_key, seen);
+        let reply =
+            format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+        let _ = stream.write_all(reply.as_bytes());
     }
 
     struct Request {
@@ -246,25 +252,7 @@ mod tests {
     }
 
     fn read_request(stream: &mut std::net::TcpStream) -> Option<Request> {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let n = stream.read(&mut chunk).ok()?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(headers_end) = find(&buf, b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&buf[..headers_end]).to_string();
-                let length = headers
-                    .lines()
-                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
-                    .unwrap_or(0);
-                if buf.len() >= headers_end + 4 + length {
-                    break;
-                }
-            }
-        }
+        let buf = read_until_complete(stream)?;
         let headers_end = find(&buf, b"\r\n\r\n")?;
         let headers = String::from_utf8_lossy(&buf[..headers_end]).to_string();
         let mut lines = headers.lines();
@@ -276,57 +264,100 @@ mod tests {
         Some(Request { method, path, body })
     }
 
+    /// Reads until the buffered bytes hold a whole request: its headers and
+    /// the body their content-length announces.
+    fn read_until_complete(stream: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while read_chunk(stream, &mut buf, &mut chunk)? && !request_complete(&buf) {}
+        Some(buf)
+    }
+
+    /// Appends the bytes one read returns to `buf`; false once the peer has
+    /// closed, so nothing more is coming.
+    fn read_chunk(stream: &mut std::net::TcpStream, buf: &mut Vec<u8>, chunk: &mut [u8]) -> Option<bool> {
+        let n = stream.read(chunk).ok()?;
+        buf.extend_from_slice(&chunk[..n]);
+        Some(n > 0)
+    }
+
+    /// Whether `buf` holds the headers and the body their content-length
+    /// announces.
+    fn request_complete(buf: &[u8]) -> bool {
+        let Some(headers_end) = find(buf, b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&buf[..headers_end]).to_string();
+        let length = headers
+            .lines()
+            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+            .unwrap_or(0);
+        buf.len() >= headers_end + 4 + length
+    }
+
     fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
         hay.windows(needle.len()).position(|w| w == needle)
     }
 
     fn handle(request: &Request, realm_id: &[u8; 32], public_key: &[u8], seen: &Arc<Mutex<Vec<String>>>) -> (String, String) {
         if request.method == "POST" && request.path == "/api/v1/join/sessions" {
-            let Ok(body) = serde_json::from_str::<Json>(&request.body) else {
-                return ("400 Bad Request".into(), r#"{"error":"bad json"}"#.into());
-            };
-            let Some(proof_json) = body.get("proof") else {
-                return ("400 Bad Request".into(), r#"{"error":"missing_proof"}"#.into());
-            };
-            let mut request_body = body.clone();
-            if let Some(map) = request_body.as_object_mut() {
-                map.remove("proof");
-            }
-            let Ok(message_request) = proof::canonical_json(&request_body) else {
-                return ("400 Bad Request".into(), r#"{"error":"bad_request"}"#.into());
-            };
-            let Ok(proof) = proof_from_json(proof_json) else {
-                return ("400 Bad Request".into(), r#"{"error":"bad_proof"}"#.into());
-            };
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-            match proof::verify_device_request(public_key, realm_id, JOIN_SESSION_PROCEDURE, &message_request, &proof, now) {
-                Ok(()) => {
-                    seen.lock().map(|mut s| s.push("create-verified".into())).ok();
-                    ("201 Created".into(), r#"{"session_id":"s-1","join_url":"https://realm.example/join/s-1","expires_at":"+10m"}"#.into())
-                }
-                Err(reason) => ("400 Bad Request".into(), format!(r#"{{"error":"{reason}"}}"#)),
-            }
+            handle_create(request, realm_id, public_key, seen)
         } else if request.method == "GET" && request.path.starts_with("/api/v1/join/sessions/") {
-            let count = seen.lock().map(|mut s| {
-                let pending = s.iter().filter(|m| m.as_str() == "pending").count();
-                s.push(if pending == 0 { "pending".into() } else { "confirmed".into() });
-                pending
-            });
-            match count {
-                Ok(0) => ("200 OK".into(), r#"{"status":"pending","expires_at":"+10m"}"#.into()),
-                _ => (
-                    "200 OK".into(),
-                    concat!(
-                        r#"{"status":"confirmed","org_identity":"mri:org:io.macula/rgfaber","#,
-                        r#""cert_pem":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n","#,
-                        r#""citizen_did":"0011","ucan":"eyJhbGciOiJFUzI1NiJ9.eyJleHAiOjE3OTIwMDAwMDB9.sig"}"#
-                    )
-                    .into(),
-                ),
-            }
+            handle_poll(seen)
         } else {
             ("404 Not Found".into(), r#"{"error":"not found"}"#.into())
         }
+    }
+
+    /// Verifies a create request's proof exactly as the realm does.
+    fn handle_create(request: &Request, realm_id: &[u8; 32], public_key: &[u8], seen: &Arc<Mutex<Vec<String>>>) -> (String, String) {
+        let Ok(body) = serde_json::from_str::<Json>(&request.body) else {
+            return ("400 Bad Request".into(), r#"{"error":"bad json"}"#.into());
+        };
+        let Some(proof_json) = body.get("proof") else {
+            return ("400 Bad Request".into(), r#"{"error":"missing_proof"}"#.into());
+        };
+        let mut request_body = body.clone();
+        if let Some(map) = request_body.as_object_mut() {
+            map.remove("proof");
+        }
+        let Ok(message_request) = proof::canonical_json(&request_body) else {
+            return ("400 Bad Request".into(), r#"{"error":"bad_request"}"#.into());
+        };
+        let Ok(proof) = proof_from_json(proof_json) else {
+            return ("400 Bad Request".into(), r#"{"error":"bad_proof"}"#.into());
+        };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        if let Err(reason) = proof::verify_device_request(public_key, realm_id, JOIN_SESSION_PROCEDURE, &message_request, &proof, now) {
+            return ("400 Bad Request".into(), format!(r#"{{"error":"{reason}"}}"#));
+        }
+        seen.lock().map(|mut s| s.push("create-verified".into())).ok();
+        ("201 Created".into(), r#"{"session_id":"s-1","join_url":"https://realm.example/join/s-1","expires_at":"+10m"}"#.into())
+    }
+
+    /// Answers a poll: pending the first time, confirmed after.
+    fn handle_poll(seen: &Arc<Mutex<Vec<String>>>) -> (String, String) {
+        match record_poll(seen) {
+            Some(0) => ("200 OK".into(), r#"{"status":"pending","expires_at":"+10m"}"#.into()),
+            _ => (
+                "200 OK".into(),
+                concat!(
+                    r#"{"status":"confirmed","org_identity":"mri:org:io.macula/rgfaber","#,
+                    r#""cert_pem":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n","#,
+                    r#""citizen_did":"0011","ucan":"eyJhbGciOiJFUzI1NiJ9.eyJleHAiOjE3OTIwMDAwMDB9.sig"}"#
+                )
+                .into(),
+            ),
+        }
+    }
+
+    /// Records this poll in the mock's log and reports how many earlier polls
+    /// were still pending.
+    fn record_poll(seen: &Arc<Mutex<Vec<String>>>) -> Option<usize> {
+        let mut log = seen.lock().ok()?;
+        let pending = log.iter().filter(|m| m.as_str() == "pending").count();
+        log.push(if pending == 0 { "pending".into() } else { "confirmed".into() });
+        Some(pending)
     }
 
     fn proof_from_json(value: &Json) -> Result<DeviceRequestProof, String> {
