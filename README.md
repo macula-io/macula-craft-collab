@@ -9,15 +9,27 @@ seam: it implements the seam's `Transport` over
 [macula-rust](https://crates.io/crates/macula-rust), and supplies what the
 seam leaves to an adapter.
 
-It tracks the released crates only: macula-rust 0.11 (the wire 1.0 final) and
-macula-craft-seam 0.5. A node on this crate reaches stations on wire 1.0 and
-no others.
+It tracks the released crates only: macula-rust 0.14 and macula-craft-seam 0.6.
+A node on this crate reaches stations on wire 1.0 and no others.
 
 - **Identity**: one persistent signing key per person per device (OS secure
   store, file fallback). The node id is derived from it; every message is
   signed, and a message whose author is not its verified publisher is dropped.
 - **Grants**: the host signs per-document grants, revocations and invite tokens
   (`IdentityIssuer`); every peer verifies them (`verified_access`).
+- **A shared document travels sealed**: every message is published under the
+  share's group — `<realm>/~<host>/craft/<share>`, the share id random and new
+  per session — and sealed under that group's current epoch key. A realm member
+  without the grant, and every station relaying it, sees ciphertext and the
+  facts a topic and an envelope carry, never the document. There is no clear
+  path in this crate: a publication that is not under the group is refused
+  rather than sent in the open.
+- **The host distributes the group's key**: it serves `<~host>/group_keys_v1`
+  in its own namespace, sealed and grant-gated (`Roster`, which answers who may
+  pull from the grants, revocations and invites the host minted), and answers a
+  pull before a person knocks, because a joiner must hold the key to publish
+  its join request. A revoked holder is refused every epoch; a grant minted
+  after the revocation is the host's yes again.
 - **Realm membership**: device-tier join, the realm sign-in session, and
   `RealmMemberVerifier`, which admits members of a realm by their
   membership UCAN (issued by the realm's key, audience = the presenting node).
@@ -32,13 +44,47 @@ no others.
   fingerprint they checked. A host in one realm can share a document with
   another realm's members.
 
+## When the key cannot be had
+
+A share fails closed: nothing is ever sent in the clear. If the share's key
+distributor is not answering, `MeshTransport::connect` still returns, with
+`waiting()` naming `no_distributor`, and the transport retries until it does;
+every publication meanwhile is refused, and an application shows that waiting
+state instead of pretending the document is shared. Any other refusal — the
+distributor saying `not_a_member`, say — fails the connect outright, because
+waiting would never end.
+
+## One share per instance
+
+An instance shares one document: its group prefix is minted for it, and it
+serves that share's distributor. Sharing two documents at once needs one pool
+and one distributor serving several groups (macula-craft-collab#27).
+
 ## Topics
 
-- `craft/collab/text_edited_v1`: document text updates
-- `craft/collab/cursor_moved_v1`: cursor presence
-- `craft/collab/document_shared_v1`: join snapshot request and response
+Every topic is the share's prefix and one name, so five segments in all:
+
+- `<prefix>/text_edited_v1`: document text updates
+- `<prefix>/cursor_moved_v1`: cursor presence
+- `<prefix>/document_shared_v1`: join snapshot request and response
+- `<prefix>/command_applied_v1`: replayed commands
+- `<prefix>/join_requested_v1`: a person asking to be let in
+- `<prefix>/grant_issued_v1`: the host's grant
+- `<prefix>/holder_revoked_v1`: the host's revocation
 
 The document id, author and payload are in the message, never in the topic.
+
+## Tests
+
+`cargo test` runs the unit tests and, in `tests/share.rs`, a share end to end
+against macula-go's in-process stations: a host, an invited joiner, an edit
+each way, a revoked holder, and a realm member who reads ciphertext only. The
+stations are built first:
+
+```sh
+./scripts/build-teststation.sh   # needs Go; writes target/teststation
+cargo test
+```
 
 ## Examples
 

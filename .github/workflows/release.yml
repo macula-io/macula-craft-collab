@@ -25,6 +25,13 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME#v} is not the crate version $PACKAGE_VERSION"
             exit 1
           fi
+      # The share tests dial macula-go's in-process stations
+      # (tests/teststation), built to target/teststation first.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/teststation/go.mod
+          cache-dependency-path: tests/teststation/go.sum
+      - run: ./scripts/build-teststation.sh
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo fmt --all -- --check

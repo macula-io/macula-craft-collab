@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 
 use craft_collab::{BodyParagraph, CollabSession, Role, ShareContext, TextStore};
 
-use crate::{Identity, IdentityIssuer, MeshConfig, MeshTransport, RealmCredential, RealmMemberVerifier, RealmTrust, Share, Tier};
+use crate::{Identity, IdentityIssuer, MeshConfig, MeshTransport, RealmCredential, RealmMemberVerifier, RealmTrust, Roster, Share, Tier, hex_bytes};
 
 /// The realm a fresh identity signs in to.
 pub const DEFAULT_REALM: &str = "io.macula";
@@ -219,22 +219,34 @@ impl CraftMesh {
         if cfg.station.is_empty() || cfg.realm.is_empty() {
             return Err(format!("{path}: station and realm are required without an invite"));
         }
-        let transport =
-            MeshTransport::connect(&mesh_config(&cfg.station, &cfg.realm, &cfg.realm_name, &cfg.realm_key, Share::default())?, &identity)?;
+        // A raw-coordinates instance mints the share's group, which is what
+        // makes it the share's key distributor. `join` asks the peers for the
+        // document, but it cannot name the group: a share id is random and
+        // per session, so a session that ends takes its prefix with it. An
+        // instance that should rejoin does so through a fresh invite line,
+        // never by guessing a prefix and sharing a private room of one.
+        if cfg.join {
+            return Err(format!(
+                "{path}: a share's group is minted per session, so an instance that joins needs an invite line, not raw station and realm coordinates"
+            ));
+        }
+        // The host's own admission record: it answers the key distributor
+        // this share serves, and every grant, revocation and invite the
+        // session mints is written into it.
+        let roster = Roster::new(identity.node_id()).map_err(|e| format!("{path}: the share's admission record: {e}"))?;
+        let checks = roster.checks();
+        let mut config = mesh_config(&cfg.station, &cfg.realm, &cfg.realm_name, &cfg.realm_key, Share::default())?;
+        config.membership = Some(checks.membership);
+        config.removed = Some(checks.removed);
+        let transport = MeshTransport::connect(&config, &identity)?;
         // The share this session carries: a host has just minted one, and the
         // session needs it to put in every invite it mints from here on.
         let share_group = transport.group_prefix().to_string();
         // A raw-coordinates config is the document owner's instance: it holds
-        // the access table, mints grants and can invite. `join` only says
-        // whether it asks the peers for the document (a host restart reopens
-        // as a join; a fresh owner does not need to).
-        let mut session = if cfg.join {
-            CollabSession::join(&cfg.doc, &cfg.name, Box::new(transport))
-        } else {
-            CollabSession::host(&cfg.doc, &cfg.name, Box::new(transport), body)
-        };
+        // the access table, mints grants and can invite.
+        let mut session = CollabSession::host(&cfg.doc, &cfg.name, Box::new(transport), body);
         session.set_access(identity.verified_access(&cfg.doc));
-        session.set_issuer(Box::new(IdentityIssuer::new(identity.clone())));
+        session.set_issuer(Box::new(IdentityIssuer::new(identity.clone()).with_roster(roster)));
         session.set_auto_approve(cfg.auto_approve);
         let trust_path = crate::realm::trust::trust_path();
         if !cfg.trust_realms.is_empty() {
@@ -400,6 +412,10 @@ fn mesh_config(seed: &str, realm: &str, realm_name: &str, realm_key: &str, share
         realm_key: hex_bytes(realm_key).map_err(|e| format!("realm key: {e}"))?,
         realm_name: realm_name.to_string(),
         share,
+        // A joiner serves nothing: the host's checks are set by the host path
+        // that mints the share's group.
+        membership: None,
+        removed: None,
     })
 }
 
@@ -434,16 +450,6 @@ impl TextStore for PersonFile {
 /// A filename-safe slug for an identity or document id.
 fn safe_slug(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
-}
-
-fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) || !s.is_ascii() {
-        return Err("hex digits expected, in pairs".into());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| s.get(i..i + 2).ok_or("hex").and_then(|p| u8::from_str_radix(p, 16).map_err(|_| "hex")).map_err(String::from))
-        .collect()
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], String> {

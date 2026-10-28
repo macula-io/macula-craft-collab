@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use craft_collab::{Kind, Message, Transport};
-use macula_craft_collab::{Identity, MeshConfig, MeshTransport, Share};
+use macula_craft_collab::{Identity, MeshConfig, MeshTransport, Roster, Share};
 
 fn arg(i: usize) -> String {
     std::env::args().nth(i).unwrap_or_else(|| {
@@ -37,6 +37,10 @@ fn main() {
         realm_key: Vec::new(),
         realm_name: "io.macula".into(),
         share: Share::default(),
+        // This probe is its own share's host: it serves the key distributor,
+        // and the record of who may pull is its own.
+        membership: None,
+        removed: None,
     };
     let slug: String = label.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
     let identity = match Identity::load_or_create("pq_hybrid", &slug, &label) {
@@ -46,6 +50,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let checks = Roster::new(identity.node_id()).expect("the probe's admission record").checks();
+    let cfg = MeshConfig { membership: Some(checks.membership), removed: Some(checks.removed), ..cfg };
     let mut mesh = match MeshTransport::connect(&cfg, &identity) {
         Ok(m) => m,
         Err(e) => {

@@ -21,6 +21,7 @@ pub mod grant;
 pub mod identity;
 pub mod issuer;
 pub mod realm;
+pub mod roster;
 
 pub use craft_mesh::{CraftMesh, DEFAULT_REALM};
 pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verified_access_from, verify_grant};
@@ -28,6 +29,7 @@ pub use identity::Identity;
 pub use issuer::{IdentityIssuer, verify_invite};
 pub use realm::trust::{RealmDescriptor, RealmTrust, TrustedRealm};
 pub use realm::{RealmCredential, RealmMemberVerifier, Tier};
+pub use roster::Roster;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -36,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use craft_collab::{Kind, Message, Transport};
 use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
-use macula_rust::group::{Group, Reason};
-use macula_rust::node_key::NodeKey;
+use macula_rust::group::{Distributor, DistributorOptions, Group, MembershipCheck, Policy, Reason, RemovedCheck, org_of};
+use macula_rust::node_key::{NodeKey, key_id_of};
 use macula_rust::pool::{Opts, Pool, Seed, Subscription};
 use macula_rust::station_link::Event;
 use tokio::sync::mpsc::UnboundedSender;
@@ -78,7 +80,7 @@ pub struct Share {
 
 /// How to reach the shared document's realm: the seed station and the realm.
 /// The identity (key and node id) comes from [`Identity`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MeshConfig {
     pub host: String,
     pub port: u16,
@@ -93,6 +95,30 @@ pub struct MeshConfig {
     pub realm_name: String,
     /// The share this transport carries.
     pub share: Share,
+    /// The host's answer to "may this node hold the share group's key",
+    /// consulted by the distributor this node serves. Closures, so the
+    /// transport never names the host's record's type; `None` on a joiner,
+    /// which serves nothing — and on a host that would then serve no
+    /// distributor, so the share fails closed rather than travels unsealed.
+    pub membership: Option<MembershipCheck>,
+    /// The host's answer to "has this node been removed for good": revoked,
+    /// with no grant newer than the revocation. Absolute: asked before the
+    /// membership check and again after it.
+    pub removed: Option<RemovedCheck>,
+}
+
+impl std::fmt::Debug for MeshConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("station_node_id", &self.station_node_id)
+            .field("realm_id", &self.realm_id)
+            .field("realm_name", &self.realm_name)
+            .field("share", &self.share)
+            .field("host_checks", &(self.membership.is_some() && self.removed.is_some()))
+            .finish()
+    }
 }
 
 /// One node's view of a shared document, over the mesh.
@@ -110,6 +136,9 @@ pub struct MeshTransport {
     /// This node's current membership UCAN of the transport's realm, kept
     /// renewed by the mesh thread (macula-realm#46).
     membership: Arc<Mutex<Option<String>>>,
+    /// Why the share is not usable yet, when it is not: the key distributor
+    /// has not answered, and every publication is refused until it does.
+    waiting: Arc<Mutex<Option<Reason>>>,
 }
 
 /// What became of the events a share's topics delivered that could not be
@@ -161,6 +190,15 @@ impl MeshTransport {
     pub fn group_prefix(&self) -> &str {
         &self.prefix
     }
+
+    /// Why this node is not in its share yet, when it is not: the group's key
+    /// distributor has not answered. An application shows the waiting state
+    /// from this, and publishes nothing until it is `None` — a publication
+    /// attempted meanwhile is refused, never sent in the clear. `None` means
+    /// the share's seven topics are subscribed under a key this node holds.
+    pub fn waiting(&self) -> Option<Reason> {
+        self.waiting.lock().ok().and_then(|waiting| *waiting)
+    }
 }
 
 /// What the background thread publishes.
@@ -183,7 +221,8 @@ impl MeshTransport {
     /// prefix by its invite and must already hold the group's grant, because
     /// the key pull happens before the join request it is asked for.
     pub fn connect(cfg: &MeshConfig, identity: &Identity) -> Result<MeshTransport, String> {
-        let prefix = match cfg.share.prefix.is_empty() {
+        let host = cfg.share.prefix.is_empty();
+        let prefix = match host {
             true => mint_prefix(&cfg.realm_name, identity.node_id())?,
             false => cfg.share.prefix.clone(),
         };
@@ -200,14 +239,28 @@ impl MeshTransport {
         let arrivals_in_thread = arrivals.clone();
         let membership = Arc::new(Mutex::new(None));
         let membership_in_thread = membership.clone();
+        let waiting = Arc::new(Mutex::new(None));
+        let waiting_in_thread = waiting.clone();
         std::thread::Builder::new()
             .name("macula-craft-collab".into())
             .spawn(move || {
-                run_on_new_runtime(cfg, key, identity, group, in_tx, ready_tx, dropped_in_thread, arrivals_in_thread, membership_in_thread);
+                run_on_new_runtime(
+                    cfg,
+                    host,
+                    key,
+                    identity,
+                    group,
+                    in_tx,
+                    ready_tx,
+                    dropped_in_thread,
+                    arrivals_in_thread,
+                    membership_in_thread,
+                    waiting_in_thread,
+                );
             })
             .map_err(|e| format!("thread: {e}"))?;
         match ready_rx.recv() {
-            Ok(Ok(out)) => Ok(MeshTransport { author, prefix, out, incoming: in_rx, dropped_unverified: dropped, arrivals, membership }),
+            Ok(Ok(out)) => Ok(MeshTransport { author, prefix, out, incoming: in_rx, dropped_unverified: dropped, arrivals, membership, waiting }),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("the mesh thread ended before it was ready: {e}")),
         }
@@ -223,6 +276,65 @@ fn mint_prefix(realm_name: &str, host_hex: &str) -> Result<String, String> {
     getrandom::getrandom(&mut id).map_err(|e| format!("no randomness for a share id: {e}"))?;
     let share: String = id.iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!("{realm_name}/~{host_hex}/craft/{share}"))
+}
+
+/// How long the host's own credential to pull its share's key lives. It
+/// bounds nothing but this session — the host is the org, so there is no
+/// grant for it to outlive — and it is minted again at every connect.
+const HOST_CREDENTIAL_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
+
+/// The group this node subscribes and publishes under: the one it was given,
+/// or, as a host, the one it minted a prefix for — its distributor served and
+/// its own credential pulled from it. The serving comes back so the share
+/// keeps it for as long as it runs.
+async fn joined_group(
+    pool: &Pool,
+    cfg: &MeshConfig,
+    key: &Arc<NodeKey>,
+    group: &Group,
+    host: bool,
+) -> Result<(Group, Option<macula_rust::pool::Served>), String> {
+    match host {
+        true => serve_share(pool, cfg, key, group).await.map(|(group, served)| (group, Some(served))),
+        false => Ok((group.clone(), None)),
+    }
+}
+
+/// The host's half of a share: serve its key distributor in this node's own
+/// namespace, then take the host's own credential, so its join below is a
+/// pull like any other. Returns the group to subscribe and publish under,
+/// and the serving, which must be kept for as long as the share lasts.
+async fn serve_share(pool: &Pool, cfg: &MeshConfig, key: &Arc<NodeKey>, group: &Group) -> Result<(Group, macula_rust::pool::Served), String> {
+    let (Some(membership), Some(removed)) = (cfg.membership.clone(), cfg.removed.clone()) else {
+        return Err(
+            "this host has no admission record for its share, so it can admit nobody to the document's key: refusing to share rather than fail later"
+                .into(),
+        );
+    };
+    let served = serve_distributor(pool, cfg, key, group, membership, removed).await?;
+    let self_id = key.node_id().map_err(|e| format!("the identity's node id: {e:?}"))?;
+    let org = org_of(&group.prefix).map_err(|e| format!("the share's prefix: {e}"))?;
+    let now_ms = craft_collab::now_ms();
+    let ucan = crate::issuer::group_ucan(key, &cfg.realm_name, org, &self_id, HOST_CREDENTIAL_MS, now_ms)?;
+    Ok((Group { prefix: group.prefix.clone(), ucan: ucan.into_bytes(), distributor: Some(self_id) }, served))
+}
+
+/// Serves `<org>/group_keys_v1` for the share, sealed and grant-gated, with
+/// this host's own answers for who may pull.
+async fn serve_distributor(
+    pool: &Pool,
+    cfg: &MeshConfig,
+    key: &Arc<NodeKey>,
+    group: &Group,
+    membership: MembershipCheck,
+    removed: RemovedCheck,
+) -> Result<macula_rust::pool::Served, String> {
+    let org = org_of(&group.prefix).map_err(|e| format!("the share's prefix: {e}"))?;
+    let mut options = DistributorOptions::new(org, Policy::Required, membership);
+    options.removed = removed;
+    let distributor = Distributor::new(options).map_err(|e| format!("the key distributor: {e}"))?;
+    let org_key_id = key_id_of(&key.public_key(), key.profile());
+    pool.serve(distributor.offer(cfg.realm_id, org_key_id)).await.map_err(|e| format!("the share's key distributor was not served: {e:?}"))
 }
 
 impl MeshTransport {
@@ -243,6 +355,9 @@ impl MeshTransport {
 /// builder and the loop do not drift apart.
 struct MeshThread {
     cfg: MeshConfig,
+    /// Whether this node minted the share's prefix, which is what makes it
+    /// the share's key distributor.
+    host: bool,
     key: Arc<NodeKey>,
     identity: Identity,
     group: Group,
@@ -250,6 +365,7 @@ struct MeshThread {
     dropped: Arc<AtomicU64>,
     arrivals: Arrivals,
     membership: Arc<Mutex<Option<String>>>,
+    waiting: Arc<Mutex<Option<Reason>>>,
 }
 
 /// Builds the mesh thread's runtime and runs the transport loop on it. A
@@ -257,6 +373,7 @@ struct MeshThread {
 #[allow(clippy::too_many_arguments)]
 fn run_on_new_runtime(
     cfg: MeshConfig,
+    host: bool,
     key: Arc<NodeKey>,
     identity: Identity,
     group: Group,
@@ -265,6 +382,7 @@ fn run_on_new_runtime(
     dropped: Arc<AtomicU64>,
     arrivals: Arrivals,
     membership: Arc<Mutex<Option<String>>>,
+    waiting: Arc<Mutex<Option<Reason>>>,
 ) {
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -273,20 +391,24 @@ fn run_on_new_runtime(
             return;
         }
     };
-    let thread = MeshThread { cfg, key, identity, group, ready, dropped, arrivals, membership };
+    let thread = MeshThread { cfg, host, key, identity, group, ready, dropped, arrivals, membership, waiting };
     rt.block_on(run(thread, in_tx));
 }
 
 /// Runs until the transport is dropped: then the outbound channel closes,
 /// the loop ends and the pool closes.
 async fn run(thread: MeshThread, in_tx: Sender<Message>) {
-    let MeshThread { cfg, key, identity, group, ready, dropped, arrivals, membership } = thread;
-    let mut opts = Opts::new(key);
+    let MeshThread { cfg, host, key, identity, group, ready, dropped, arrivals, membership, waiting } = thread;
+    let mut opts = Opts::new(key.clone());
     // Pubsub needs no realm trust: it is only consulted when a call resolves
     // an advertisement. An empty key means "trust nothing in this realm".
     if !cfg.realm_key.is_empty() {
         opts.realm_trust.insert(cfg.realm_id, cfg.realm_key.clone());
     }
+    // This node opens sealed requests (a key pull is one) and, as a host,
+    // advertises a sealed procedure: both need the KEM key in the
+    // advertisement.
+    opts.kem_advertise = true;
     let seeds = vec![Seed { host: cfg.host.clone(), port: cfg.port, node_id: cfg.station_node_id }];
     let pool = match Pool::connect(seeds, opts).await {
         Ok(pool) => pool,
@@ -310,20 +432,27 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
         tokio::spawn(realm::keep_memberships_renewed(pool.clone(), identity.clone(), cfg.realm_id, membership));
     }
 
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
-    for name in NAMES {
-        let topic = topic_of(&group.prefix, name);
-        // Subscribing under the group joins it first, so the key is pulled
-        // before this session can publish anything: a joiner has its key
-        // before it knocks. A group whose key cannot be had fails here rather
-        // than falling back to the clear.
-        let Ok(sub) = pool.subscribe_group(&cfg.realm_id, &topic, &group).await else {
-            let _ = ready.send(Err(format!("subscribe {topic}")));
+    // A host serves its share's key distributor before it pulls anything:
+    // its own join below is a pull from itself, and a share whose key cannot
+    // be had fails here rather than falling back to the clear.
+    let (group, _served) = match joined_group(&pool, &cfg, &key, &group, host).await {
+        Ok(joined) => joined,
+        Err(e) => {
+            let _ = ready.send(Err(e));
             return;
-        };
-        let tx = in_tx.clone();
-        let arrivals = arrivals.clone();
-        tokio::spawn(pump_events(sub, tx, dropped.clone(), arrivals));
+        }
+    };
+
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
+    // Subscribing under the group joins it first, so the key is pulled before
+    // this session can publish anything: a joiner has its key before it
+    // knocks. A group whose key cannot be had fails closed — and while the
+    // share's distributor is simply not answering yet, the transport waits
+    // for it instead of taking the session down (threat model T11).
+    let started = start_share(&pool, &cfg, &group, &in_tx, &dropped, &arrivals, &waiting).await;
+    if let Err(e) = started {
+        let _ = ready.send(Err(e));
+        return;
     }
     // The transport holds the only sender; when it drops, the channel ends.
     let _ = ready.send(Ok(out_tx));
@@ -360,6 +489,99 @@ async fn publish_sealed(pool: &Pool, realm: [u8; 32], group: &Group, topic: Stri
 /// The topic a message's kind travels on, under the share's prefix.
 fn topic_of(prefix: &str, name: &str) -> String {
     format!("{prefix}/{name}")
+}
+
+/// How long a share waits for its key distributor before asking it again.
+const DISTRIBUTOR_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Puts the share on the wire: subscribed under its group, or waiting for the
+/// distributor that holds the key. `Err` is the share's own refusal, which
+/// fails the connect rather than waiting for ever.
+#[allow(clippy::too_many_arguments)]
+async fn start_share(
+    pool: &Pool,
+    cfg: &MeshConfig,
+    group: &Group,
+    in_tx: &Sender<Message>,
+    dropped: &Arc<AtomicU64>,
+    arrivals: &Arrivals,
+    waiting: &Arc<Mutex<Option<Reason>>>,
+) -> Result<(), String> {
+    match subscribe_all(pool, cfg, group).await {
+        Ok(subs) => {
+            *waiting.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            pump_all(subs, in_tx, dropped, arrivals);
+            Ok(())
+        }
+        Err(e) if e.is(Reason::NoDistributor) => {
+            *waiting.lock().unwrap_or_else(|p| p.into_inner()) = Some(Reason::NoDistributor);
+            tokio::spawn(wait_for_distributor(
+                pool.clone(),
+                cfg.clone(),
+                group.clone(),
+                in_tx.clone(),
+                dropped.clone(),
+                arrivals.clone(),
+                waiting.clone(),
+            ));
+            Ok(())
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+/// Subscribes this node to every topic a share carries, all or none: each
+/// subscription joins the share's group first, which is the key pull, so a
+/// refusal is the group's answer and not one topic's.
+async fn subscribe_all(pool: &Pool, cfg: &MeshConfig, group: &Group) -> Result<Vec<Subscription>, macula_rust::group::GroupError> {
+    let mut subs = Vec::with_capacity(NAMES.len());
+    for name in NAMES {
+        let topic = topic_of(&group.prefix, name);
+        subs.push(pool.subscribe_group(&cfg.realm_id, &topic, group).await?);
+    }
+    Ok(subs)
+}
+
+/// Hands each subscription to the transport, on a task of its own.
+fn pump_all(subs: Vec<Subscription>, in_tx: &Sender<Message>, dropped: &Arc<AtomicU64>, arrivals: &Arrivals) {
+    for sub in subs {
+        tokio::spawn(pump_events(sub, in_tx.clone(), dropped.clone(), arrivals.clone()));
+    }
+}
+
+/// Waits for the share's key distributor, then subscribes: the visible,
+/// fail-closed waiting state of threat model T11. Until it answers, nothing
+/// is subscribed and every publication is refused; the reason is published
+/// through `waiting` so an application can say what it is waiting for.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_distributor(
+    pool: Pool,
+    cfg: MeshConfig,
+    group: Group,
+    in_tx: Sender<Message>,
+    dropped: Arc<AtomicU64>,
+    arrivals: Arrivals,
+    waiting: Arc<Mutex<Option<Reason>>>,
+) {
+    loop {
+        tokio::time::sleep(DISTRIBUTOR_RETRY).await;
+        match subscribe_all(&pool, &cfg, &group).await {
+            Ok(subs) => {
+                *waiting.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                pump_all(subs, &in_tx, &dropped, &arrivals);
+                return;
+            }
+            // The share goes on waiting for it; anything else is the group's
+            // answer, and a share waiting on that would wait for ever.
+            Err(e) if e.is(Reason::NoDistributor) => {}
+            Err(e) => {
+                let reason = e.reason().unwrap_or(Reason::NoDistributor);
+                *waiting.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
+                eprintln!("craft-collab: the share cannot be joined: {e}");
+                return;
+            }
+        }
+    }
 }
 
 /// Feeds a subscription's events to the transport until the transport drops
@@ -458,6 +680,17 @@ fn name_for(kind: &Kind) -> &'static str {
 pub fn verified_message(json: &str, publisher_hex: &str) -> Option<Message> {
     let msg: Message = serde_json::from_str(json).ok()?;
     (msg.author == publisher_hex).then_some(msg)
+}
+
+/// Hex digits in pairs, as bytes.
+pub(crate) fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
+        return Err("hex digits expected, in pairs".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| s.get(i..i + 2).ok_or("hex").and_then(|p| u8::from_str_radix(p, 16).map_err(|_| "hex")).map_err(String::from))
+        .collect()
 }
 
 #[cfg(test)]

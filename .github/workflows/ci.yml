@@ -54,6 +54,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         run: rustup update stable
+      # The share tests dial macula-go's in-process stations
+      # (tests/teststation), built to target/teststation first.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/teststation/go.mod
+          cache-dependency-path: tests/teststation/go.sum
+      - run: ./scripts/build-teststation.sh
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test

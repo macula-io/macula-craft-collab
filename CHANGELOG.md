@@ -5,6 +5,50 @@ All notable changes to this crate are documented here. Format follows
 so a minor version may carry a small breaking change where one was the right
 call.
 
+## [Unreleased]
+
+A shared document is readable only by its holders (macula-craft-collab#26).
+Not released: the threat model is on the issue, and 0.8.0 is cut once the
+acceptance list is met.
+
+### Changed
+
+- **Every message a share carries is sealed.** A share is a group: the prefix
+  `<realm>/~<host>/craft/<share>`, where the share id is random and minted per
+  session and never derived from the document id, and the seven topics hang
+  under it as `<prefix>/<name>_v1`. The host mints the prefix when it starts
+  sharing; a joiner is given it by its invite (macula-craft-seam 0.6, invite
+  v5) together with the credential that pulls its key. There is no clear arm
+  left: a publication not under the group is refused, and an event that arrives
+  clear under it is refused and counted (`clear_refused`), so a policy
+  regression would show instead of leaking.
+- **The host serves the share's key distributor.** `<~host>/group_keys_v1`
+  (macula-rust 0.14's `Distributor`), sealed and grant-gated, pinned by the
+  invite to the host's node id. Its admission answers come from `Roster` — the
+  grants, revocations and invites the host itself minted — so an invitee can
+  pull the key before it knocks, a revoked holder is refused every epoch, and a
+  grant newer than the revocation admits again. The host's own key comes from
+  the same distributor, pulled like anyone else's.
+- **A share that cannot have its key waits, visibly, and fails closed.**
+  `MeshTransport::waiting()` names `no_distributor` while the distributor is
+  not answering, and the transport retries; any other refusal fails the
+  connect, because waiting would never end. Publications are refused
+  throughout (`unopened()`, `last_unopened()` and `clear_refused()` count what
+  a share saw and could not use).
+- **macula-rust 0.14 and macula-craft-seam 0.6**, released crates only, no
+  `[patch]` and no path override.
+- `--collab <config.json>` is the hosting instance: its `join` flag is refused
+  rather than honoured, because a share id is minted per session and an
+  instance that should rejoin does so through a fresh invite line.
+
+### Added
+
+- `tests/share.rs`: a share end to end against macula-go's in-process stations
+  (built by `scripts/build-teststation.sh`, which CI now runs): the host, an
+  invited joiner, an edit each way, a realm member reading ciphertext only, a
+  revoked holder refused the key and its own edit opened but not applied, and a
+  share pinned to another node waiting rather than joining.
+
 ## [0.7.0] - 2026-10-20
 
 The release for the wire 1.0 fleet.
