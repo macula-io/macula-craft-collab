@@ -5,11 +5,13 @@ All notable changes to this crate are documented here. Format follows
 so a minor version may carry a small breaking change where one was the right
 call.
 
-## [Unreleased]
+## [0.8.0] - 2026-10-28
 
 A shared document is readable only by its holders (macula-craft-collab#26).
-Not released: the threat model is on the issue, and 0.8.0 is cut once the
-acceptance list is met.
+The threat model and the acceptance list it was built against are on the issue.
+A sealed share is readable by the people the host invited **and by the host
+itself**; what that does not mean, and the bounds on revocation, are collected
+under "Limits in this release" below.
 
 ### Changed
 
@@ -37,11 +39,11 @@ acceptance list is met.
   with a ten-minute invite would cut a live holder off the key while its grant,
   and the document, went on working. What refuses a pull is `Roster`, never the
   credential's expiry: a lapsed invite with no grant minted since is still
-  refused. Held down by a live test with a two-second invite; the rotation
-  itself is not proven live, because macula-rust 0.14 cannot shorten the
-  interval from the member side (macula-io/macula-rust#52), so this release
-  says the two-second test is the same property at the layer available, not that
-  a rotation was observed.
+  refused. Held down by a live test with a two-second invite. The rotation
+  itself is not proven live: this crate serves its distributor at macula-rust's
+  default interval and never asks for a shorter one (macula-craft-collab#28), so
+  the two-second test is the same property at the layer available — not an
+  observed rotation, and this release does not claim one.
 - **A share that cannot have its key waits, visibly, and fails closed.**
   `MeshTransport::waiting()` names what a share is waiting for — `no_distributor`
   while the distributor is not answering, and `not_a_member` or
@@ -64,6 +66,14 @@ acceptance list is met.
   (macula-craft-collab#27). The limit fails closed: a share whose key cannot be had
   waits (`no_distributor`) and never publishes in the clear, and a group under
   another org is refused by the distributor rather than served.
+- **The host is in the reader set.** It wrote the document and serves its key.
+  Sealed here means readable by the holders and by the host's own node — not by
+  the realm, not by the stations, and not by a revoked holder past the bounds
+  below.
+- **Revocation cannot unread what was read.** A revoked holder keeps everything
+  it already opened, and can still open events sealed under any epoch it already
+  holds until that epoch's accept time — at most 90 minutes after its removal.
+  New edits stop reaching it much sooner, in about 20 minutes.
 
 ### Added
 
