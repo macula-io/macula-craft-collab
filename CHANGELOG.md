@@ -13,6 +13,20 @@ A sealed share is readable by the people the host invited **and by the host
 itself**; what that does not mean, and the bounds on revocation, are collected
 under "Limits in this release" below.
 
+### Breaking
+
+- **A sealed share can no longer be shared with a realm.** A hosting config with
+  `share_realm` or `share_role` is refused with a message naming the limit
+  (threat model decision 5), where it used to admit any realm member presenting
+  a live membership. Their grants renew from their own membership while the
+  credential that pulls a share's key is minted once per invite line and never
+  renewed, and those two lifetimes cannot be reconciled in this release. A
+  sealed share goes to named people, one invite each; `share_verifier` stays in
+  the crate for the release that models a realm share's key.
+- **A sealed share must name its distributor.** `MeshTransport::connect` refuses
+  a joiner's `Share` with no `distributor`, instead of letting macula-rust's
+  member side auto-pin the first answer that arrives (threat model T5).
+
 ### Changed
 
 - **Every message a share carries is sealed.** A share is a group: the prefix
@@ -21,9 +35,10 @@ under "Limits in this release" below.
   under it as `<prefix>/<name>_v1`. The host mints the prefix when it starts
   sharing; a joiner is given it by its invite (macula-craft-seam 0.6, invite
   v5) together with the credential that pulls its key. There is no clear arm
-  left: a publication not under the group is refused, and an event that arrives
-  clear under it is refused and counted (`clear_refused`), so a policy
-  regression would show instead of leaking.
+  left: a publication that cannot be sealed is refused and counted
+  (`refused_publications`), and an event that arrives clear under the prefix is
+  refused and counted (`clear_refused`), so a policy regression would show
+  instead of leaking.
 - **The host serves the share's key distributor.** `<~host>/group_keys_v1`
   (macula-rust 0.14's `Distributor`), sealed and grant-gated, pinned by the
   invite to the host's node id. Its admission answers come from `Roster` — the
@@ -76,20 +91,26 @@ under "Limits in this release" below.
   it already opened, and can still open events sealed under any epoch it already
   holds until that epoch's accept time — at most 90 minutes after its removal.
   New edits stop reaching it much sooner, in about 20 minutes.
-- **A sealed share goes to named people, not to a realm.** `share_realm` and
-  `share_role` are refused with a message naming the limit (threat model
-  decision 5): realm members renew their grants from their own membership while
-  the credential that pulls a share's key is minted once per invite line, and
-  those two lifetimes cannot be reconciled here. The same refusal applies to an
-  open invite, which has no node to bind a credential to.
+- **A share is retried, not healed, while its distributor is away.** A share
+  whose key cannot be had waits (`no_distributor`) and every publication in the
+  meantime is refused and counted; nothing is sent in the clear. A line from an
+  ended session waits the same way — the wait itself is not bounded yet
+  (macula-craft-collab#31).
 
 ### Added
 
+- **`refused_publications()` and `unusable()`**, so no refusal is silent in
+  either direction: a message this node could not publish is counted (the seam's
+  `send` is fire-and-forget and cannot see it), and an event that opened but
+  carried no message is counted instead of dropped.
 - `tests/share.rs`: a share end to end against macula-go's in-process stations
   (built by `scripts/build-teststation.sh`, which CI now runs): the host, an
   invited joiner, an edit each way, a realm member reading ciphertext only, a
-  revoked holder refused the key and its own edit opened but not applied, and a
-  share pinned to another node waiting rather than joining.
+  revoked holder refused the key and its own edit opened but not applied, a
+  revoked holder still refused across a host transport restart with a re-invite
+  admitted, a share pinned to another node waiting rather than joining, a share
+  with no pin refused, a publication that cannot be sealed counted, and a short
+  invite whose credential still pulls after it lapses.
 
 ## [0.7.0] - 2026-10-20
 

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::lab::Lab;
-use craft_collab::{BodyParagraph, CollabSession, GrantIssuer as _, Inbound, Invite, Role, ShareContext};
+use craft_collab::{BodyParagraph, CollabSession, GrantIssuer as _, Inbound, Invite, Role, ShareContext, Transport as _};
 use macula_craft_collab::{
     GROUP_CREDENTIAL_MS, Identity, IdentityIssuer, MeshConfig, MeshTransport, Roster, Share, verified_access_from, verify_invite,
 };
@@ -402,6 +402,37 @@ async fn a_share_pinned_to_another_node_waits_for_a_distributor_that_never_answe
     assert_eq!(transport.waiting(), Some(Reason::NoDistributor), "the waiting state names what it is waiting for");
 }
 
+/// T11's other half: a publication that cannot be sealed is refused, counted,
+/// and never sent in the clear. The seam's `send` is fire-and-forget, so the
+/// count (`refused_publications`) is the only thing that tells an application
+/// an edit did not leave — and two copies that differ are known to differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_that_cannot_be_sealed_is_counted_and_never_sent_clear() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let lab = Lab::start(PROFILE);
+    let realm = realm(&lab);
+    let bob = identity(dir.path(), "bob", "Bob");
+    let eve = identity(dir.path(), "eve", "Eve");
+    // A share pinned to a node that serves no distributor: nothing can be
+    // sealed, and nothing is sent anyway.
+    let share =
+        Share { prefix: format!("{REALM_NAME}/~{}/craft/0123456789abcdef", eve.node_id()), grant: Vec::new(), distributor: Some(node32(&eve)) };
+    let transport = MeshTransport::connect(&realm.config(REALM_NAME, share), &bob).expect("the transport waits rather than joining nothing");
+    assert_eq!(transport.waiting(), Some(Reason::NoDistributor), "the share is waiting for a distributor that is not there");
+
+    let mut transport = transport;
+    let msg = craft_collab::Message {
+        doc: DOC.into(),
+        author: transport.author(),
+        epoch: 1,
+        seq: 1,
+        sent_at_ms: 0,
+        kind: craft_collab::Kind::CursorMoved { position: Some("nothing may leave".into()), name: None },
+    };
+    transport.send(msg).expect("send is fire-and-forget: it queues and returns");
+    assert!(refused_publication_counted(&transport).await, "the refused publication is counted, not swallowed");
+}
+
 // T8 — "a holder of share A is refused the key for share B" — is NOT tested
 // here, and cannot be yet: both shares of one host have the same org
 // (`~<host>`), and the wire names a distributor by `<org>/group_keys_v1`, so
@@ -410,3 +441,109 @@ async fn a_share_pinned_to_another_node_waits_for_a_distributor_that_never_answe
 // this transport (one share per transport, one pool each) does not do. The
 // gap is macula-craft-collab#27; until it lands, a Craft instance shares one
 // document, which is what every Craft app's config does today.
+
+/// T5, enforced rather than left to the caller: a share that names no
+/// distributor is refused at connect. macula-rust's member side auto-pins the
+/// first answer when no pin is given, so an unpinned sealed share would be
+/// joined on whoever answered first.
+#[test]
+fn a_sealed_share_without_a_pin_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let lab = Lab::start(PROFILE);
+    let realm = realm(&lab);
+    let bob = identity(dir.path(), "bob", "Bob");
+    let share = Share { prefix: format!("{REALM_NAME}/~{}/craft/0123456789abcdef", "aa".repeat(32)), grant: Vec::new(), distributor: None };
+    let err = match MeshTransport::connect(&realm.config(REALM_NAME, share), &bob) {
+        Ok(_) => panic!("an unpinned sealed share is refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("must be pinned"), "{err}");
+}
+
+/// T4: the host's admission record is what refuses a pull, and it lives in the
+/// host's own process beside the share it guards — so a host transport that
+/// reconnects (the restart the threat model singles out: same share prefix,
+/// same record) still refuses a revoked holder, and a re-invite still admits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_record_refuses_across_a_host_transport_restart() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let lab = Lab::start(PROFILE);
+    let realm = realm(&lab);
+    let alice = identity(dir.path(), "alice", "Alice");
+    let bob = identity(dir.path(), "bob", "Bob");
+    let served = serve(&realm, &alice);
+    let issuer = IdentityIssuer::new(alice.clone()).with_roster(served.roster.clone());
+    let now = craft_collab::now_ms();
+    let credential = issuer.group_grant(DOC, &served.group, Some(bob.node_id()), 600_000, now).expect("an invite for Bob");
+    let share = group(&served.group, &credential, node32(&alice));
+    pull(&realm, &bob, &share).await.expect("an invitee pulls the key before it knocks");
+
+    issuer.revoke(DOC, bob.node_id(), now + 1).expect("revoked");
+    assert!(served.roster.removed(&served.group, node32(&bob)), "the record says removed");
+    let refused = pull(&realm, &bob, &share).await.expect_err("a revoked holder is refused");
+    assert_eq!(refused.reason(), Some(Reason::NotAMember), "{refused}");
+
+    // The host's transport goes away and comes back on the same share: the
+    // record is the same object, because it belongs to the session.
+    let checks = served.roster.checks();
+    let Served { transport, roster, group: prefix } = served;
+    drop(transport);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let cfg = MeshConfig {
+        hosting: true,
+        share: Share { prefix: prefix.clone(), ..Share::default() },
+        membership: Some(checks.membership),
+        removed: Some(checks.removed),
+        ..realm.config(REALM_NAME, Share::default())
+    };
+    let restarted = MeshTransport::connect(&cfg, &alice).expect("the host serves its share again");
+
+    // Still refused, on the restarted distributor.
+    let after = pull_until_answered(&realm, &bob, &share).await;
+    assert_eq!(after.reason(), Some(Reason::NotAMember), "a restart does not forget a revocation: {after}");
+
+    // And a re-invite is still the host's yes.
+    issuer.issue(DOC, bob.node_id(), Role::Editor, 600_000, now + 2).expect("re-invited");
+    let admitted = pull_until_admitted(&realm, &bob, &share).await;
+    assert!(admitted, "a grant newer than the revocation admits again after the restart");
+    assert!(!roster.removed(&prefix, node32(&bob)), "the newer grant is the last word");
+    drop(restarted);
+}
+
+/// One pull, retried until the restarted distributor admits: a re-invite is a
+/// publication of its own and the record answers it as soon as it is signed.
+async fn pull_until_admitted(realm: &Realm, identity: &Identity, group: &macula_rust::group::Group) -> bool {
+    for _ in 0..60 {
+        if pull(realm, identity, group).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// Whether a refused publication shows up in the count within a few seconds:
+/// the publish is queued to the mesh thread and counted there.
+async fn refused_publication_counted(transport: &MeshTransport) -> bool {
+    for _ in 0..50 {
+        if transport.refused_publications() > 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// One pull, retried until the restarted distributor answers at all: a
+/// just-connected host has not advertised its distributor yet, and
+/// `no_distributor` is a wait rather than an answer.
+async fn pull_until_answered(realm: &Realm, identity: &Identity, group: &macula_rust::group::Group) -> macula_rust::group::GroupError {
+    for _ in 0..60 {
+        match pull(realm, identity, group).await {
+            Ok(_) => panic!("a revoked holder pulled the key across the restart"),
+            Err(e) if e.reason() == Some(Reason::NoDistributor) => tokio::time::sleep(Duration::from_millis(200)).await,
+            Err(e) => return e,
+        }
+    }
+    panic!("the restarted host never advertised its distributor");
+}

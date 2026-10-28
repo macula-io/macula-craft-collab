@@ -163,6 +163,14 @@ struct Arrivals {
     /// this crate refuses its own copy anyway, because only `required` gives
     /// that for free and this count is how a regression would show.
     clear_refused: Arc<AtomicU64>,
+    /// Events that were opened and then discarded because they carried no
+    /// message this crate could use (a payload that is not `{"json": Text}`).
+    unusable: Arc<AtomicU64>,
+    /// Messages **this** node tried to publish and the mesh refused, for any
+    /// reason. Nothing is sent in the clear instead, so this is the number
+    /// that says an edit did not leave: an application shows it and the two
+    /// copies are known to differ rather than silently going their own way.
+    refused_outbound: Arc<AtomicU64>,
 }
 
 impl MeshTransport {
@@ -188,6 +196,22 @@ impl MeshTransport {
     /// refused: zero in a correct session.
     pub fn clear_refused(&self) -> u64 {
         self.arrivals.clear_refused.load(Ordering::Relaxed)
+    }
+
+    /// How many events this share opened and then could not use: the payload
+    /// carried no message. Counted rather than dropped quietly, like the
+    /// three inbound refusals beside it.
+    pub fn unusable(&self) -> u64 {
+        self.arrivals.unusable.load(Ordering::Relaxed)
+    }
+
+    /// How many of this node's own publications the mesh refused. Nothing is
+    /// ever sent in the clear instead, so a non-zero count means an edit did
+    /// not leave — the one case where two copies diverge and neither person
+    /// would otherwise be told (`waiting()` is set too when the reason is
+    /// about the share rather than the message).
+    pub fn refused_publications(&self) -> u64 {
+        self.arrivals.refused_outbound.load(Ordering::Relaxed)
     }
 
     /// The share's group prefix: the host's minted one, or the one an invite
@@ -234,6 +258,17 @@ impl MeshTransport {
                 return Err("a joiner is given its share's group prefix by the invite; without one there is nothing to join".into());
             }
         };
+        // Every share here is sealed, and a sealed share's distributor is
+        // pinned (threat model T5): macula-rust's member side auto-pins the
+        // first answer when no pin is given, so a share that names none is
+        // refused here rather than joined on whoever answers first. The one
+        // exception is a host, which is its own distributor and pins itself
+        // further down.
+        if !host && cfg.share.distributor.is_none() {
+            return Err(format!(
+                "{prefix}: a sealed share's distributor must be pinned to a node id (the invite names it); an unpinned share is refused rather than joined on the first answer"
+            ));
+        }
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (in_tx, in_rx) = std::sync::mpsc::channel::<Message>();
         let cfg = cfg.clone();
@@ -473,7 +508,7 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
                 // Through the renewal path, so a person's stored fields stay.
                 let _ = reply.send(realm::renew_membership(&pool, &identity, &realm_name, now).await);
             }
-            Outbound::Publish(topic, json) => publish_sealed(&pool, realm, &group, topic, json, &waiting).await,
+            Outbound::Publish(topic, json) => publish_sealed(&pool, realm, &group, topic, json, &waiting, &arrivals).await,
         }
     }
     pool.close().await;
@@ -482,20 +517,29 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
 /// Publishes one message sealed under the share's group.
 ///
 /// There is no clear arm on purpose: a publication that is not under the
-/// group is refused rather than sent in the open. A publication that fails —
-/// the publisher's epochs have all stopped publishing and the pull that would
-/// renew them failed — is reported and not sent: the seam sees the message
-/// never left, and the app's waiting state (`no_distributor`) is what it
-/// shows. Never a clear fallback.
-async fn publish_sealed(pool: &Pool, realm: [u8; 32], group: &Group, topic: String, json: String, waiting: &Arc<Mutex<Option<Reason>>>) {
+/// group is refused rather than sent in the open. A publication that fails is
+/// counted (`refused_publications`) and not sent: the message never left, and
+/// nothing goes out in the clear instead. A reason that is about the share
+/// rather than this message — the key is out of reach, this node was removed —
+/// also sets `waiting()`; a reason that is about the one message leaves the
+/// share usable and the counter is the signal. The seam does not see the
+/// failure (`send` is fire-and-forget), so the count is what an application
+/// shows.
+async fn publish_sealed(
+    pool: &Pool,
+    realm: [u8; 32],
+    group: &Group,
+    topic: String,
+    json: String,
+    waiting: &Arc<Mutex<Option<Reason>>>,
+    arrivals: &Arrivals,
+) {
     let payload = Value::Map(vec![(Value::text("json"), Value::text(json))]);
     match pool.publish_group(&realm, &topic, group, payload).await {
         Ok(()) => note_sharing(waiting, None),
         Err(e) => {
-            // The message never left. A refusal that says the group's key is
-            // out of reach is the waiting state an application shows; the
-            // seam sees that the message did not go, and nothing is sent in
-            // the clear.
+            // The message never left: counted, and never sent in the clear.
+            arrivals.refused_outbound.fetch_add(1, Ordering::Relaxed);
             eprintln!("craft-collab: {topic} was not published: {e:?}");
             if let Some(reason) = waiting_reason(&e) {
                 note_sharing(waiting, Some(reason));
@@ -680,6 +724,9 @@ fn deliver_event(event: &Event, tx: &Sender<Message>, dropped: &Arc<AtomicU64>, 
         Payload::Sealed(_) => None,
     };
     let Some(json) = json else {
+        // Opened, and then nothing this crate can carry: counted, not
+        // swallowed.
+        arrivals.unusable.fetch_add(1, Ordering::Relaxed);
         return true;
     };
     match verified_message(&json, &publisher) {
@@ -863,5 +910,22 @@ mod tests {
         assert!(rx.try_recv().is_err(), "a forged author is not delivered");
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert_eq!(arrivals.clear_refused.load(Ordering::Relaxed), 0, "an opened event is not a clear one");
+    }
+
+    /// An event that opened and carried nothing this crate can use is counted,
+    /// not swallowed: it is the one inbound drop that used to leave no mark.
+    #[test]
+    fn an_opened_event_without_a_message_is_counted() {
+        let (tx, rx) = arriving();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let arrivals = Arrivals::default();
+        let waiting = Arc::new(Mutex::new(None));
+        let payload = Payload::Clear(Value::Map(vec![(Value::text("note"), Value::text("not a message"))]));
+        let event = event(payload, Some([2u8; 8]), None);
+        assert!(deliver_event(&event, &tx, &dropped, &arrivals, &waiting));
+        assert!(rx.try_recv().is_err(), "nothing unusable is handed to the seam");
+        assert_eq!(arrivals.unusable.load(Ordering::Relaxed), 1, "and it is counted");
+        assert_eq!(dropped.load(Ordering::Relaxed), 0, "not a forged author");
+        assert_eq!(arrivals.clear_refused.load(Ordering::Relaxed), 0, "not a clear event either");
     }
 }
