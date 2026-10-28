@@ -31,19 +31,21 @@ under "Limits in this release" below.
   pull the key before it knocks, a revoked holder is refused every epoch, and a
   grant newer than the revocation admits again. The host's own key comes from
   the same distributor, pulled like anyone else's.
-- **The invitee's key credential outlives a short invite.** It is minted for a
-  day (`GROUP_CREDENTIAL_MS`, the seam's grant ceiling) **plus the invite's own
-  life**, because the grant it must outlast is minted at the knock, and the
-  knock may come at the last second the invite is live. It is presented on every
-  key pull and epochs rotate every fifteen minutes, so a credential that died
-  with a ten-minute invite would cut a live holder off the key while its grant,
-  and the document, went on working. What refuses a pull is `Roster`, never the
-  credential's expiry: a lapsed invite with no grant minted since is still
-  refused. Held down by a live test with a two-second invite. The rotation
-  itself is not proven live: this crate serves its distributor at macula-rust's
-  default interval and never asks for a shorter one (macula-craft-collab#28), so
-  the two-second test is the same property at the layer available — not an
-  observed rotation, and this release does not claim one.
+- **The invitee's key credential outlives every grant it can meet.** It is
+  minted at the UCAN ceiling (`GROUP_CREDENTIAL_MS`, ten years less a minute),
+  not at the invite's own life: the grant it must outlast is minted when the
+  host **approves** the join, a pending joiner has no expiry in the seam, and a
+  yes can come days later — with five minutes of clock tolerance on top. It is
+  presented on every key pull, so a credential that died with a ten-minute
+  invite would cut a live holder off the key while its grant, and the document,
+  went on working. Its job is only that: what admits a pull is `Roster`, never
+  the credential's expiry, and a share's prefix is random per session, so an old
+  credential names a share that no longer exists and pulls nothing. Held down by
+  a live test with a two-second invite. The rotation itself is not proven live:
+  this crate serves its distributor at macula-rust's default interval and never
+  asks for a shorter one (macula-craft-collab#28), so the two-second test is the
+  same property at the layer available — not an observed rotation, and this
+  release does not claim one.
 - **A share that cannot have its key waits, visibly, and fails closed.**
   `MeshTransport::waiting()` names what a share is waiting for — `no_distributor`
   while the distributor is not answering, and `not_a_member` or
@@ -74,6 +76,12 @@ under "Limits in this release" below.
   it already opened, and can still open events sealed under any epoch it already
   holds until that epoch's accept time — at most 90 minutes after its removal.
   New edits stop reaching it much sooner, in about 20 minutes.
+- **A sealed share goes to named people, not to a realm.** `share_realm` and
+  `share_role` are refused with a message naming the limit (threat model
+  decision 5): realm members renew their grants from their own membership while
+  the credential that pulls a share's key is minted once per invite line, and
+  those two lifetimes cannot be reconciled here. The same refusal applies to an
+  open invite, which has no node to bind a credential to.
 
 ### Added
 

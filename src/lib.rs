@@ -552,8 +552,13 @@ async fn start_share(
             pump_all(subs, in_tx, dropped, arrivals, waiting);
             Ok(())
         }
-        Err(e) if e.is(Reason::NoDistributor) => {
-            *waiting.lock().unwrap_or_else(|p| p.into_inner()) = Some(Reason::NoDistributor);
+        // Two reasons are the share waiting for an answer rather than a
+        // refusal of it: no distributor yet, and a distributor that cannot say
+        // who is a member. Both may change without this node doing anything,
+        // so both are retried instead of ending the share.
+        Err(e) if e.is(Reason::NoDistributor) || e.is(Reason::MembershipUnknown) => {
+            let reason = e.reason().unwrap_or(Reason::NoDistributor);
+            *waiting.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
             tokio::spawn(wait_for_distributor(
                 pool.clone(),
                 cfg.clone(),
@@ -610,9 +615,10 @@ async fn wait_for_distributor(
                 pump_all(subs, &in_tx, &dropped, &arrivals, &waiting);
                 return;
             }
-            // The share goes on waiting for it; anything else is the group's
+            // Two reasons go on waiting: no distributor yet, and one that
+            // cannot read this node's membership. Anything else is the group's
             // answer, and a share waiting on that would wait for ever.
-            Err(e) if e.is(Reason::NoDistributor) => {}
+            Err(e) if e.is(Reason::NoDistributor) || e.is(Reason::MembershipUnknown) => {}
             Err(e) => {
                 let reason = e.reason().unwrap_or(Reason::NoDistributor);
                 *waiting.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);

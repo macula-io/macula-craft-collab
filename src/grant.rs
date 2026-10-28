@@ -85,16 +85,9 @@ impl GrantVerifier for KeyGrantVerifier {
 /// An access table for `doc` from a host key and profile named as strings
 /// (the form an invite carries them in).
 pub fn verified_access_from(doc: &str, host_key_hex: &str, profile: &str) -> Result<Access, String> {
-    let key = crate::grant::hex_bytes(host_key_hex)?;
+    let key = crate::hex_bytes(host_key_hex)?;
     let profile = Profile::parse(profile).map_err(|e| format!("profile: {e}"))?;
     Ok(verified_access(doc, key, profile))
-}
-
-fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
-        return Err("an odd number of hex digits".into());
-    }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string())).collect()
 }
 
 /// An access table for `doc` whose grants install only when signed by the

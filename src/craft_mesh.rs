@@ -230,6 +230,19 @@ impl CraftMesh {
                 "{path}: a share's group is minted per session, so an instance that joins needs an invite line, not raw station and realm coordinates"
             ));
         }
+        // A sealed share cannot be shared with a realm (threat model decision 5,
+        // T14): realm members would renew their grants from their own
+        // membership, without the host, while the credential that pulls this
+        // share's key is minted once per invite line and never renewed — two
+        // lifetimes that cannot be reconciled from here, so the shape is
+        // refused before anything is served or connected. `share_verifier`
+        // stays for the release that models a realm share's key; until then a
+        // sealed share goes to named people, one invite each.
+        if cfg.share_realm.is_some() || cfg.share_role.is_some() {
+            return Err(format!(
+                "{path}: a sealed share cannot be shared with a realm: invite named people instead (macula-craft-collab#26, decision 5)"
+            ));
+        }
         // The share's group, minted here because the admission record is
         // about exactly this prefix and no other (threat model T8): a holder
         // of one share is nobody in another, even another of this host's.
@@ -255,15 +268,6 @@ impl CraftMesh {
         if !cfg.trust_realms.is_empty() {
             let trust_path = trust_path.as_deref().ok_or("no config directory for the realm trust list")?;
             trust_realms(trust_path, &cfg.trust_realms).map_err(|e| format!("{path}: {e}"))?;
-        }
-        if let Some(realm) = cfg.share_realm.as_deref() {
-            let role = match cfg.share_role.as_deref() {
-                Some("editor") => Role::Editor,
-                None | Some("viewer") => Role::Viewer,
-                Some(other) => return Err(format!("{path}: unknown share_role `{other}` (viewer or editor)")),
-            };
-            let verifier = share_verifier(realm, role, &cfg.realm, &cfg.realm_key, trust_path.as_deref()).map_err(|e| format!("{path}: {e}"))?;
-            session.set_member_verifier(Box::new(verifier));
         }
         session.set_share_context(ShareContext {
             realm: cfg.realm,
@@ -562,8 +566,34 @@ mod tests {
         assert!(hex_bytes("abc").is_err());
         assert!(hex_bytes("zz").is_err());
         assert!(hex_bytes("éé").is_err());
+        // A pair boundary inside a multi-byte character: the panic a hostile
+        // pasted invite used to reach (macula-craft-collab#26 review r=3).
+        assert!(hex_bytes("aéb").is_err(), "a half character is refused, not sliced through");
+        assert!(hex_bytes("aaé").is_err());
         assert!(mesh_config("no-colons", &"aa".repeat(32), "io.macula", "", Share::default()).is_err());
         assert!(mesh_config("h:99999:aa", &"aa".repeat(32), "io.macula", "", Share::default()).is_err());
         assert_eq!(safe_slug("a/b c"), "a_b_c");
+    }
+
+    /// A sealed share cannot be shared with a realm: the config is refused with
+    /// a message naming the limit, before anything is served or connected
+    /// (threat model decision 5), rather than admitting realm members whose
+    /// grants renew while their key credential cannot.
+    #[test]
+    fn a_sealed_share_refuses_a_realm_share() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("collab.json");
+        let config = format!(
+            r#"{{"doc":"demo","name":"Alice","station":"127.0.0.1:4433:{}","realm":"{}","realm_key":"","share_realm":"io.macula"}}"#,
+            "aa".repeat(32),
+            "bb".repeat(32)
+        );
+        std::fs::write(&path, config).expect("write");
+        let err = match CraftMesh::attach(path.to_str().expect("utf-8"), &[]) {
+            Ok(_) => panic!("a sealed share with a realm share is refused"),
+            Err(err) => err,
+        };
+        assert!(err.contains("cannot be shared with a realm"), "{err}");
+        assert!(err.contains("decision 5"), "and names the decision: {err}");
     }
 }
