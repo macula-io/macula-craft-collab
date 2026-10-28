@@ -44,13 +44,17 @@ impl IdentityIssuer {
     }
 }
 
-/// How long an invitee's credential to pull a share's key lives: as long as a
-/// grant can (the seam's own ceiling for one, a day), and never the invite
-/// line's own, shorter life. The credential is a bearer for the share, and
-/// what admits a pull is the host's admission record, not this expiry: a
-/// credential that died with a ten-minute invite would cut a live holder off
-/// the key at the tenth minute — epochs rotate every fifteen, so it would stop
-/// opening new edits while its grant, and the document, went on working.
+/// How long an invitee's credential to pull a share's key lives, on top of the
+/// invite's own life: as long as a grant can (the seam's own ceiling for one, a
+/// day). The credential is a bearer for the share, and what admits a pull is
+/// the host's admission record, not this expiry: a credential that died with a
+/// ten-minute invite would cut a live holder off the key at the tenth minute —
+/// epochs rotate every fifteen, so it would stop opening new edits while its
+/// grant, and the document, went on working.
+///
+/// It is added to the invite's life rather than compared with it, because the
+/// grant it must outlast is minted at the knock, and the knock may come at the
+/// last second the invite is live: a day alone could end before that grant.
 pub const GROUP_CREDENTIAL_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// The credential a holder presents to pull the key of the sealed group
@@ -135,10 +139,11 @@ impl GrantIssuer for IdentityIssuer {
     /// caller, so it is refused here rather than minted into a line anyone
     /// could use.
     ///
-    /// The credential lives [`GROUP_CREDENTIAL_MS`], or the invite's own life
-    /// when that is longer — never the shorter of the two, which is what the
-    /// seam's `mint` would hand it: see [`GROUP_CREDENTIAL_MS`] for why, and
-    /// [`crate::Roster`] for what actually refuses a pull.
+    /// The credential lives [`GROUP_CREDENTIAL_MS`] **plus** the invite's own
+    /// life: the grant it must outlast is minted at the knock, which may come
+    /// at the last second the invite is live. It is never shorter than either;
+    /// see [`GROUP_CREDENTIAL_MS`] for why, and [`crate::Roster`] for what
+    /// actually refuses a pull.
     fn group_grant(&self, _doc: &str, group: &str, holder: Option<&str>, ttl_ms: u64, now_ms: u64) -> Result<String, String> {
         let Some(holder) = holder else {
             return Err("an open invite cannot be sealed: invite people by name".into());
@@ -149,7 +154,11 @@ impl GrantIssuer for IdentityIssuer {
             return Err(format!("this host does not serve {org}: its own share groups are under {own}"));
         }
         let audience: [u8; 32] = crate::hex_bytes(holder)?.try_into().map_err(|_| "an invitee's node id is 32 bytes".to_string())?;
-        let credential = group_ucan(&self.identity.key(), realm, org, &audience, ttl_ms.max(GROUP_CREDENTIAL_MS), now_ms)?;
+        // A day, plus the invite's own life: the grant this credential must
+        // outlast is minted at the knock, which may come as late as the last
+        // second of a live invite, so the floor alone could end an hour (or
+        // ten minutes) before that grant does.
+        let credential = group_ucan(&self.identity.key(), realm, org, &audience, GROUP_CREDENTIAL_MS.saturating_add(ttl_ms), now_ms)?;
         if let Some(roster) = &self.roster {
             // The invite's own life, not the credential's: an invitee is a
             // reader while its invite is live, and a lapsed invite with no
@@ -303,7 +312,8 @@ mod tests {
         let invitee = "bb".repeat(32);
         let issuer = IdentityIssuer::new(id.clone());
 
-        // A one-minute invite: the credential still runs the whole floor.
+        // A one-minute invite: the credential runs a day *plus* the invite, so
+        // a knock at the invite's last second still ends inside it.
         let credential = issuer.group_grant("demo", &group, Some(&invitee), 60_000, 1_000).expect("a credential");
         let minted = claims(&credential);
         assert_eq!(minted["aud"], serde_json::json!(invitee), "bound to the invitee");
@@ -312,13 +322,17 @@ mod tests {
             serde_json::json!([{"with": format!("mri:org:io.macula/~{host}"), "can": "group_keys"}]),
             "the host's own org, for group keys"
         );
-        assert_eq!(minted["exp"], serde_json::json!(1 + (GROUP_CREDENTIAL_MS / 1_000) as i64), "the floor, not the invite's minute");
+        assert_eq!(
+            minted["exp"],
+            serde_json::json!(1 + (GROUP_CREDENTIAL_MS / 1_000) as i64 + 60),
+            "the floor and the invite's minute, not the minute alone"
+        );
         assert_eq!(minted["iss"].as_str().map(|iss| iss.starts_with("did:")), Some(true), "signed by the host's key");
 
-        // A longer invite is not cut down to the floor: the credential is
-        // never shorter-lived than the line it travels with.
+        // A longer invite is not cut down to the floor either: the credential
+        // is always the invite's own life on top of it.
         let long = issuer.group_grant("demo", &group, Some(&invitee), 48 * 60 * 60 * 1_000, 1_000).expect("a long credential");
-        assert_eq!(claims(&long)["exp"], serde_json::json!(1 + 48 * 60 * 60), "the invite's own two days");
+        assert_eq!(claims(&long)["exp"], serde_json::json!(1 + (GROUP_CREDENTIAL_MS / 1_000) as i64 + 48 * 60 * 60), "the floor and the two days");
     }
 
     /// A sealed share is shared with named people: an open invite has no node

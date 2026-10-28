@@ -29,9 +29,24 @@ acceptance list is met.
   pull the key before it knocks, a revoked holder is refused every epoch, and a
   grant newer than the revocation admits again. The host's own key comes from
   the same distributor, pulled like anyone else's.
+- **The invitee's key credential outlives a short invite.** It is minted for a
+  day (`GROUP_CREDENTIAL_MS`, the seam's grant ceiling) **plus the invite's own
+  life**, because the grant it must outlast is minted at the knock, and the
+  knock may come at the last second the invite is live. It is presented on every
+  key pull and epochs rotate every fifteen minutes, so a credential that died
+  with a ten-minute invite would cut a live holder off the key while its grant,
+  and the document, went on working. What refuses a pull is `Roster`, never the
+  credential's expiry: a lapsed invite with no grant minted since is still
+  refused. Held down by a live test with a two-second invite; the rotation
+  itself is not proven live, because macula-rust 0.14 cannot shorten the
+  interval from the member side (macula-io/macula-rust#52), so this release
+  says the two-second test is the same property at the layer available, not that
+  a rotation was observed.
 - **A share that cannot have its key waits, visibly, and fails closed.**
-  `MeshTransport::waiting()` names `no_distributor` while the distributor is
-  not answering, and the transport retries; any other refusal fails the
+  `MeshTransport::waiting()` names what a share is waiting for — `no_distributor`
+  while the distributor is not answering, and `not_a_member` or
+  `membership_unknown` when a pull is refused mid-session — and the transport
+  retries; a refusal that is about one message rather than the share fails the
   connect, because waiting would never end. Publications are refused
   throughout (`unopened()`, `last_unopened()` and `clear_refused()` count what
   a share saw and could not use).
