@@ -41,6 +41,15 @@ acceptance list is met.
   rather than honoured, because a share id is minted per session and an
   instance that should rejoin does so through a fresh invite line.
 
+### Limits in this release
+
+- **One shared document per instance.** Its group prefix is minted for it and it
+  serves that share's distributor; two shares of one host would need one pool and
+  one distributor serving several groups, which this transport does not do yet
+  (macula-craft-collab#27). The limit fails closed: a share whose key cannot be had
+  waits (`no_distributor`) and never publishes in the clear, and a group under
+  another org is refused by the distributor rather than served.
+
 ### Added
 
 - `tests/share.rs`: a share end to end against macula-go's in-process stations
