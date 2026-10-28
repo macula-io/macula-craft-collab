@@ -61,12 +61,18 @@ impl Entry {
     }
 }
 
-/// The host's admission record for one share: the org it serves (this node's
-/// own namespace, `~<node id>`), the node itself, and what it decided about
-/// every other node it has invited.
+/// The host's admission record for one share: the share's own group prefix,
+/// the host itself, and what it decided about every other node it has
+/// invited.
+///
+/// The prefix is matched exactly, not by org. Every share of one host lives
+/// under `~<host>`, so an org match would admit a holder of one share to the
+/// key of another (threat model T8): the record answers for its own share and
+/// nothing else.
 pub struct Roster {
-    /// The org this record answers for: `~<host>`, the second segment of the
-    /// share's prefix.
+    /// The group prefix this record answers for, and no other.
+    prefix: String,
+    /// The org the prefix names: `~<host>`, its second segment.
     org: String,
     /// The host's own node id: it may always pull its own share's key.
     host: [u8; 32],
@@ -74,11 +80,20 @@ pub struct Roster {
 }
 
 impl Roster {
-    /// A record for the org `~host_hex`, kept by `host_hex` itself.
-    pub fn new(host_hex: &str) -> Result<Arc<Roster>, String> {
+    /// The record of the share under `prefix`, kept by `host_hex` itself.
+    pub fn new(host_hex: &str, prefix: &str) -> Result<Arc<Roster>, String> {
         let host = hex_bytes(host_hex)?;
         let host: [u8; 32] = host.try_into().map_err(|_| "a node id is 32 bytes".to_string())?;
-        Ok(Arc::new(Roster { org: format!("~{host_hex}"), host, entries: Mutex::new(BTreeMap::new()) }))
+        let org = org_of(prefix).map_err(|e| format!("the share's prefix: {e}"))?;
+        if org != format!("~{host_hex}") {
+            return Err(format!("{prefix} is not a share of ~{host_hex}: a host admits its own groups only"));
+        }
+        Ok(Arc::new(Roster { prefix: prefix.to_string(), org: org.to_string(), host, entries: Mutex::new(BTreeMap::new()) }))
+    }
+
+    /// The prefix this record answers for.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
     }
 
     /// The record's answers, as the mesh asks them.
@@ -148,10 +163,10 @@ impl Roster {
         }
     }
 
-    /// Whether `prefix` names a group of this record's org: `~<host>` is the
-    /// prefix's second segment, which is what a distributor here answers for.
+    /// Whether `prefix` is this record's own share. Exactly, not by org: a
+    /// holder of one share is nobody in another, even the same host's.
     fn owns(&self, prefix: &str) -> bool {
-        org_of(prefix).is_ok_and(|org| org == self.org)
+        prefix == self.prefix
     }
 
     fn note(&self, node: &str, what: impl FnOnce(&mut Entry)) {
@@ -205,11 +220,15 @@ mod tests {
     const NOW: u64 = 1_000_000;
 
     fn roster() -> Arc<Roster> {
-        Roster::new(&HOST.repeat(32)).expect("a roster")
+        Roster::new(&HOST.repeat(32), &prefix()).expect("a roster")
     }
 
     fn prefix() -> String {
         format!("io.macula/~{}/craft/0123456789abcdef0123456789abcdef", HOST.repeat(32))
+    }
+
+    fn another() -> String {
+        format!("io.macula/~{}/craft/fedcba9876543210fedcba9876543210", HOST.repeat(32))
     }
 
     fn node(fill: u8) -> [u8; 32] {
@@ -230,14 +249,27 @@ mod tests {
         assert!(!roster.removed(&prefix(), node(0xbb)), "and has not been removed: it was never here");
     }
 
-    /// Another org's group is not this record's to admit.
+    /// Another group is not this record's to admit — not another host's, and
+    /// not another share of the same host (threat model T8): a holder of one
+    /// share is nobody in the other.
     #[test]
-    fn another_orgs_group_is_refused_rather_than_answered() {
+    fn another_group_is_refused_rather_than_answered() {
         let roster = roster();
         let foreign = format!("io.macula/~{}/craft/0123456789abcdef0123456789abcdef", "bb".repeat(32));
         assert_eq!(roster.membership(&foreign, node(0xaa), NOW), Membership::NotAMember);
         assert!(roster.removed(&foreign, node(0xaa)), "refused, never admitted from this share's roster");
+
+        roster.note_grant(&node_hex(0xbb), NOW, NOW + 600_000);
+        assert_eq!(roster.membership(&prefix(), node(0xbb), NOW), Membership::In, "a holder of this share");
+        assert_eq!(roster.membership(&another(), node(0xbb), NOW), Membership::NotAMember, "and nobody in the same host's other share");
         assert_eq!(roster.membership("not-a-group", node(0xaa), NOW), Membership::NotAMember);
+    }
+
+    /// A record is only ever built for a prefix of the host's own org.
+    #[test]
+    fn a_record_for_another_hosts_share_is_refused() {
+        let err = Roster::new(&"bb".repeat(32), &prefix()).expect_err("not this host's share");
+        assert!(err.contains("is not a share of"), "{err}");
     }
 
     /// The key pull comes before the knock, so an invitee is a reader from the

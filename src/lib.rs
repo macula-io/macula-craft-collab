@@ -26,7 +26,7 @@ pub mod roster;
 pub use craft_mesh::{CraftMesh, DEFAULT_REALM};
 pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verified_access_from, verify_grant};
 pub use identity::Identity;
-pub use issuer::{IdentityIssuer, verify_invite};
+pub use issuer::{GROUP_CREDENTIAL_MS, IdentityIssuer, verify_invite};
 pub use realm::trust::{RealmDescriptor, RealmTrust, TrustedRealm};
 pub use realm::{RealmCredential, RealmMemberVerifier, Tier};
 pub use roster::Roster;
@@ -95,6 +95,10 @@ pub struct MeshConfig {
     pub realm_name: String,
     /// The share this transport carries.
     pub share: Share,
+    /// Whether this node is the share's host: it mints the prefix (when the
+    /// share names none) and serves the share's key distributor. A joiner is
+    /// given its prefix and credential by the invite and serves nothing.
+    pub hosting: bool,
     /// The host's answer to "may this node hold the share group's key",
     /// consulted by the distributor this node serves. Closures, so the
     /// transport never names the host's record's type; `None` on a joiner,
@@ -116,6 +120,7 @@ impl std::fmt::Debug for MeshConfig {
             .field("realm_id", &self.realm_id)
             .field("realm_name", &self.realm_name)
             .field("share", &self.share)
+            .field("hosting", &self.hosting)
             .field("host_checks", &(self.membership.is_some() && self.removed.is_some()))
             .finish()
     }
@@ -221,10 +226,13 @@ impl MeshTransport {
     /// prefix by its invite and must already hold the group's grant, because
     /// the key pull happens before the join request it is asked for.
     pub fn connect(cfg: &MeshConfig, identity: &Identity) -> Result<MeshTransport, String> {
-        let host = cfg.share.prefix.is_empty();
-        let prefix = match host {
-            true => mint_prefix(&cfg.realm_name, identity.node_id())?,
-            false => cfg.share.prefix.clone(),
+        let host = cfg.hosting;
+        let prefix = match (host, cfg.share.prefix.is_empty()) {
+            (true, true) => mint_share_prefix(&cfg.realm_name, identity.node_id())?,
+            (_, false) => cfg.share.prefix.clone(),
+            (false, true) => {
+                return Err("a joiner is given its share's group prefix by the invite; without one there is nothing to join".into());
+            }
         };
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (in_tx, in_rx) = std::sync::mpsc::channel::<Message>();
@@ -271,7 +279,7 @@ impl MeshTransport {
 /// id random and per session. Random and not derived from the document, so a
 /// document's permanent id never appears in a topic the realm can see, and
 /// per session, so yesterday's topics are gone when sharing starts again.
-fn mint_prefix(realm_name: &str, host_hex: &str) -> Result<String, String> {
+pub fn mint_share_prefix(realm_name: &str, host_hex: &str) -> Result<String, String> {
     let mut id = [0u8; 16];
     getrandom::getrandom(&mut id).map_err(|e| format!("no randomness for a share id: {e}"))?;
     let share: String = id.iter().map(|b| format!("{b:02x}")).collect();
@@ -465,7 +473,7 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
                 // Through the renewal path, so a person's stored fields stay.
                 let _ = reply.send(realm::renew_membership(&pool, &identity, &realm_name, now).await);
             }
-            Outbound::Publish(topic, json) => publish_sealed(&pool, realm, &group, topic, json).await,
+            Outbound::Publish(topic, json) => publish_sealed(&pool, realm, &group, topic, json, &waiting).await,
         }
     }
     pool.close().await;
@@ -479,11 +487,42 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
 /// renew them failed — is reported and not sent: the seam sees the message
 /// never left, and the app's waiting state (`no_distributor`) is what it
 /// shows. Never a clear fallback.
-async fn publish_sealed(pool: &Pool, realm: [u8; 32], group: &Group, topic: String, json: String) {
+async fn publish_sealed(pool: &Pool, realm: [u8; 32], group: &Group, topic: String, json: String, waiting: &Arc<Mutex<Option<Reason>>>) {
     let payload = Value::Map(vec![(Value::text("json"), Value::text(json))]);
-    if let Err(e) = pool.publish_group(&realm, &topic, group, payload).await {
-        eprintln!("craft-collab: {topic} was not published: {e:?}");
+    match pool.publish_group(&realm, &topic, group, payload).await {
+        Ok(()) => note_sharing(waiting, None),
+        Err(e) => {
+            // The message never left. A refusal that says the group's key is
+            // out of reach is the waiting state an application shows; the
+            // seam sees that the message did not go, and nothing is sent in
+            // the clear.
+            eprintln!("craft-collab: {topic} was not published: {e:?}");
+            if let Some(reason) = waiting_reason(&e) {
+                note_sharing(waiting, Some(reason));
+            }
+        }
     }
+}
+
+/// Why a publication or an event says this node is not in its share, when it
+/// does: a key it could not pull (`no_distributor`), or a group it has been
+/// removed from. Any other reason is about one message, not the share.
+pub(crate) fn waiting_reason(error: &macula_rust::group::GroupError) -> Option<Reason> {
+    share_level(error.reason()?)
+}
+
+/// A reason that is about the share rather than one message: the key cannot
+/// be had, or this node is no longer a holder. Everything else — an event
+/// sealed under an epoch too old to open, a tag that does not verify — is
+/// about the one event that carried it.
+fn share_level(reason: Reason) -> Option<Reason> {
+    matches!(reason, Reason::NoDistributor | Reason::NotAMember | Reason::MembershipUnknown).then_some(reason)
+}
+
+/// Records the share's state: `Some(reason)` while it cannot be used, `None`
+/// once it works again.
+fn note_sharing(waiting: &Arc<Mutex<Option<Reason>>>, reason: Option<Reason>) {
+    *waiting.lock().unwrap_or_else(|p| p.into_inner()) = reason;
 }
 
 /// The topic a message's kind travels on, under the share's prefix.
@@ -510,7 +549,7 @@ async fn start_share(
     match subscribe_all(pool, cfg, group).await {
         Ok(subs) => {
             *waiting.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            pump_all(subs, in_tx, dropped, arrivals);
+            pump_all(subs, in_tx, dropped, arrivals, waiting);
             Ok(())
         }
         Err(e) if e.is(Reason::NoDistributor) => {
@@ -543,9 +582,9 @@ async fn subscribe_all(pool: &Pool, cfg: &MeshConfig, group: &Group) -> Result<V
 }
 
 /// Hands each subscription to the transport, on a task of its own.
-fn pump_all(subs: Vec<Subscription>, in_tx: &Sender<Message>, dropped: &Arc<AtomicU64>, arrivals: &Arrivals) {
+fn pump_all(subs: Vec<Subscription>, in_tx: &Sender<Message>, dropped: &Arc<AtomicU64>, arrivals: &Arrivals, waiting: &Arc<Mutex<Option<Reason>>>) {
     for sub in subs {
-        tokio::spawn(pump_events(sub, in_tx.clone(), dropped.clone(), arrivals.clone()));
+        tokio::spawn(pump_events(sub, in_tx.clone(), dropped.clone(), arrivals.clone(), waiting.clone()));
     }
 }
 
@@ -567,8 +606,8 @@ async fn wait_for_distributor(
         tokio::time::sleep(DISTRIBUTOR_RETRY).await;
         match subscribe_all(&pool, &cfg, &group).await {
             Ok(subs) => {
-                *waiting.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                pump_all(subs, &in_tx, &dropped, &arrivals);
+                note_sharing(&waiting, None);
+                pump_all(subs, &in_tx, &dropped, &arrivals, &waiting);
                 return;
             }
             // The share goes on waiting for it; anything else is the group's
@@ -586,9 +625,9 @@ async fn wait_for_distributor(
 
 /// Feeds a subscription's events to the transport until the transport drops
 /// its receiving end or the subscription ends.
-async fn pump_events(mut sub: Subscription, tx: Sender<Message>, dropped: Arc<AtomicU64>, arrivals: Arrivals) {
+async fn pump_events(mut sub: Subscription, tx: Sender<Message>, dropped: Arc<AtomicU64>, arrivals: Arrivals, waiting: Arc<Mutex<Option<Reason>>>) {
     while let Some(event) = sub.recv().await {
-        if !deliver_event(&event, &tx, &dropped, &arrivals) {
+        if !deliver_event(&event, &tx, &dropped, &arrivals, &waiting) {
             break;
         }
     }
@@ -597,7 +636,7 @@ async fn pump_events(mut sub: Subscription, tx: Sender<Message>, dropped: Arc<At
 /// Hands one delivered event to the transport as a message, or counts it as
 /// one of the ways an event can be refused; false when the receiving end has
 /// closed.
-fn deliver_event(event: &Event, tx: &Sender<Message>, dropped: &Arc<AtomicU64>, arrivals: &Arrivals) -> bool {
+fn deliver_event(event: &Event, tx: &Sender<Message>, dropped: &Arc<AtomicU64>, arrivals: &Arrivals, waiting: &Arc<Mutex<Option<Reason>>>) -> bool {
     // A sealed event that did not open arrives with no payload and the reason
     // it failed. It is counted and never applied: the alternative is a
     // ciphertext treated as a payload.
@@ -605,6 +644,11 @@ fn deliver_event(event: &Event, tx: &Sender<Message>, dropped: &Arc<AtomicU64>, 
         arrivals.unopened.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut last) = arrivals.last_unopened.lock() {
             *last = Some(reason);
+        }
+        // An event this node could not open because the key is out of reach
+        // is the same waiting state a refused publication shows.
+        if let Some(state) = share_level(reason) {
+            note_sharing(waiting, Some(state));
         }
         return true;
     }
@@ -762,8 +806,8 @@ mod tests {
     #[test]
     fn a_minted_prefix_is_random_and_names_the_host() {
         let host = "ab".repeat(32);
-        let first = mint_prefix("io.macula", &host).expect("a share id");
-        let second = mint_prefix("io.macula", &host).expect("a share id");
+        let first = mint_share_prefix("io.macula", &host).expect("a share id");
+        let second = mint_share_prefix("io.macula", &host).expect("a share id");
         assert_ne!(first, second, "a fresh share id per session");
         assert!(first.starts_with("io.macula/~abab"), "the host is in the org slot: {first}");
         assert_eq!(first.split('/').count(), 4, "{first} is a four-segment prefix");
@@ -776,8 +820,9 @@ mod tests {
         let (tx, rx) = arriving();
         let dropped = Arc::new(AtomicU64::new(0));
         let arrivals = Arrivals::default();
+        let waiting = Arc::new(Mutex::new(None));
         let event = event(Payload::Clear(Value::Null), Some([1u8; 8]), Some(Reason::UnknownEpoch));
-        assert!(deliver_event(&event, &tx, &dropped, &arrivals), "the pump carries on");
+        assert!(deliver_event(&event, &tx, &dropped, &arrivals, &waiting), "the pump carries on");
         assert!(rx.try_recv().is_err(), "the seam is handed nothing");
         assert_eq!(arrivals.unopened.load(Ordering::Relaxed), 1);
         assert_eq!(arrivals.last_unopened.lock().unwrap().as_ref(), Some(&Reason::UnknownEpoch));
@@ -791,8 +836,9 @@ mod tests {
         let (tx, rx) = arriving();
         let dropped = Arc::new(AtomicU64::new(0));
         let arrivals = Arrivals::default();
+        let waiting = Arc::new(Mutex::new(None));
         let event = event(publishable(&msg_json("0303030303")), None, None);
-        assert!(deliver_event(&event, &tx, &dropped, &arrivals));
+        assert!(deliver_event(&event, &tx, &dropped, &arrivals, &waiting));
         assert!(rx.try_recv().is_err(), "a clear event is never handed to the seam");
         assert_eq!(arrivals.clear_refused.load(Ordering::Relaxed), 1);
     }
@@ -804,9 +850,10 @@ mod tests {
         let (tx, rx) = arriving();
         let dropped = Arc::new(AtomicU64::new(0));
         let arrivals = Arrivals::default();
+        let waiting = Arc::new(Mutex::new(None));
         let forged = msg_json("aabbcc");
         let event = event(publishable(&forged), Some([2u8; 8]), None);
-        assert!(deliver_event(&event, &tx, &dropped, &arrivals));
+        assert!(deliver_event(&event, &tx, &dropped, &arrivals, &waiting));
         assert!(rx.try_recv().is_err(), "a forged author is not delivered");
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert_eq!(arrivals.clear_refused.load(Ordering::Relaxed), 0, "an opened event is not a clear one");

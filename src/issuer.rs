@@ -44,6 +44,15 @@ impl IdentityIssuer {
     }
 }
 
+/// How long an invitee's credential to pull a share's key lives: as long as a
+/// grant can (the seam's own ceiling for one, a day), and never the invite
+/// line's own, shorter life. The credential is a bearer for the share, and
+/// what admits a pull is the host's admission record, not this expiry: a
+/// credential that died with a ten-minute invite would cut a live holder off
+/// the key at the tenth minute — epochs rotate every fifteen, so it would stop
+/// opening new edits while its grant, and the document, went on working.
+pub const GROUP_CREDENTIAL_MS: u64 = 24 * 60 * 60 * 1_000;
+
 /// The credential a holder presents to pull the key of the sealed group
 /// `group`: a UCAN for the host's own `<org>/group_keys_v1`, minted by the
 /// host's key as that org, bound to `audience` — the mesh checks a UCAN's
@@ -125,6 +134,11 @@ impl GrantIssuer for IdentityIssuer {
     /// to bind this to, and macula-rust checks a UCAN's audience against the
     /// caller, so it is refused here rather than minted into a line anyone
     /// could use.
+    ///
+    /// The credential lives [`GROUP_CREDENTIAL_MS`], or the invite's own life
+    /// when that is longer — never the shorter of the two, which is what the
+    /// seam's `mint` would hand it: see [`GROUP_CREDENTIAL_MS`] for why, and
+    /// [`crate::Roster`] for what actually refuses a pull.
     fn group_grant(&self, _doc: &str, group: &str, holder: Option<&str>, ttl_ms: u64, now_ms: u64) -> Result<String, String> {
         let Some(holder) = holder else {
             return Err("an open invite cannot be sealed: invite people by name".into());
@@ -135,8 +149,11 @@ impl GrantIssuer for IdentityIssuer {
             return Err(format!("this host does not serve {org}: its own share groups are under {own}"));
         }
         let audience: [u8; 32] = crate::hex_bytes(holder)?.try_into().map_err(|_| "an invitee's node id is 32 bytes".to_string())?;
-        let credential = group_ucan(&self.identity.key(), realm, org, &audience, ttl_ms, now_ms)?;
+        let credential = group_ucan(&self.identity.key(), realm, org, &audience, ttl_ms.max(GROUP_CREDENTIAL_MS), now_ms)?;
         if let Some(roster) = &self.roster {
+            // The invite's own life, not the credential's: an invitee is a
+            // reader while its invite is live, and a lapsed invite with no
+            // grant minted since is nobody, however long the credential runs.
             roster.note_invite(holder, now_ms.saturating_add(ttl_ms));
         }
         Ok(credential)
@@ -275,9 +292,10 @@ mod tests {
 
     /// The group credential is the host's own distributor's: the org is this
     /// node, the capability is `group_keys`, the audience is the invitee, and
-    /// it never outlives the invite it travels with.
+    /// its life is the floor rather than the invite's — a credential that died
+    /// with a short invite would stop a live holder pulling the key.
     #[test]
-    fn the_group_credential_is_bound_to_its_invitee_and_to_its_invite() {
+    fn the_group_credential_is_bound_to_its_invitee_and_outlives_a_short_invite() {
         let dir = tempfile::tempdir().expect("temp dir");
         let id = identity(dir.path(), "host");
         let host = id.node_id().to_string();
@@ -285,16 +303,22 @@ mod tests {
         let invitee = "bb".repeat(32);
         let issuer = IdentityIssuer::new(id.clone());
 
+        // A one-minute invite: the credential still runs the whole floor.
         let credential = issuer.group_grant("demo", &group, Some(&invitee), 60_000, 1_000).expect("a credential");
-        let claims = claims(&credential);
-        assert_eq!(claims["aud"], serde_json::json!(invitee), "bound to the invitee");
+        let minted = claims(&credential);
+        assert_eq!(minted["aud"], serde_json::json!(invitee), "bound to the invitee");
         assert_eq!(
-            claims["cap"],
+            minted["cap"],
             serde_json::json!([{"with": format!("mri:org:io.macula/~{host}"), "can": "group_keys"}]),
             "the host's own org, for group keys"
         );
-        assert_eq!(claims["exp"], serde_json::json!(61), "the invite's lifetime, in seconds");
-        assert_eq!(claims["iss"].as_str().map(|iss| iss.starts_with("did:")), Some(true), "signed by the host's key");
+        assert_eq!(minted["exp"], serde_json::json!(1 + (GROUP_CREDENTIAL_MS / 1_000) as i64), "the floor, not the invite's minute");
+        assert_eq!(minted["iss"].as_str().map(|iss| iss.starts_with("did:")), Some(true), "signed by the host's key");
+
+        // A longer invite is not cut down to the floor: the credential is
+        // never shorter-lived than the line it travels with.
+        let long = issuer.group_grant("demo", &group, Some(&invitee), 48 * 60 * 60 * 1_000, 1_000).expect("a long credential");
+        assert_eq!(claims(&long)["exp"], serde_json::json!(1 + 48 * 60 * 60), "the invite's own two days");
     }
 
     /// A sealed share is shared with named people: an open invite has no node
@@ -330,7 +354,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let id = identity(dir.path(), "host");
         let node = format!("io.macula/~{}/craft/0123456789abcdef0123456789abcdef", id.node_id());
-        let roster = Roster::new(id.node_id()).expect("a roster");
+        let roster = Roster::new(id.node_id(), &node).expect("a roster");
         let issuer = IdentityIssuer::new(id.clone()).with_roster(roster.clone());
         let invitee = "bb".repeat(32);
         let invitee_id: [u8; 32] = crate::hex_bytes(&invitee).expect("hex").try_into().expect("32");

@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use common::lab::Lab;
 use craft_collab::{BodyParagraph, CollabSession, GrantIssuer as _, Inbound, Invite, Role, ShareContext};
-use macula_craft_collab::{Identity, IdentityIssuer, MeshConfig, MeshTransport, Roster, Share, verified_access_from, verify_invite};
+use macula_craft_collab::{
+    GROUP_CREDENTIAL_MS, Identity, IdentityIssuer, MeshConfig, MeshTransport, Roster, Share, verified_access_from, verify_invite,
+};
 use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
 use macula_rust::group::Reason;
@@ -66,6 +68,7 @@ impl Realm {
             realm_key: self.key.clone(),
             realm_name: realm_name.to_string(),
             share,
+            hosting: false,
             membership: None,
             removed: None,
         }
@@ -88,9 +91,16 @@ struct Served {
 }
 
 fn serve(realm: &Realm, identity: &Identity) -> Served {
-    let roster = Roster::new(identity.node_id()).expect("the host's admission record");
+    let prefix = macula_craft_collab::mint_share_prefix(REALM_NAME, identity.node_id()).expect("a share prefix");
+    let roster = Roster::new(identity.node_id(), &prefix).expect("the host's admission record");
     let checks = roster.checks();
-    let cfg = MeshConfig { membership: Some(checks.membership), removed: Some(checks.removed), ..realm.config(REALM_NAME, Share::default()) };
+    let cfg = MeshConfig {
+        hosting: true,
+        share: Share { prefix, ..Share::default() },
+        membership: Some(checks.membership),
+        removed: Some(checks.removed),
+        ..realm.config(REALM_NAME, Share::default())
+    };
     let transport = MeshTransport::connect(&cfg, identity).expect("the host serves its share");
     let group = transport.group_prefix().to_string();
     Served { transport, roster, group }
@@ -273,6 +283,39 @@ async fn until(what: &str, host: &mut CollabSession, joiner: &mut CollabSession,
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("{what} did not happen");
+}
+
+/// Neptunus's r=1 finding 1, live: the credential that pulls the share's key
+/// is presented on every pull, and epochs rotate every fifteen minutes, so one
+/// that died with a short invite would cut a live holder off the key while its
+/// grant, and the document, still worked. A two-second invite now buys a
+/// credential that still pulls once the invite is long gone — and an invite
+/// that lapses with no grant minted since is still nobody: the host's record,
+/// not the credential's expiry, is the admission (threat model §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_invites_credential_still_pulls_after_the_invite_lapses() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let lab = Lab::start(PROFILE);
+    let realm = realm(&lab);
+    let alice = identity(dir.path(), "alice", "Alice");
+    let bob = identity(dir.path(), "bob", "Bob");
+    let carol = identity(dir.path(), "carol", "Carol");
+    let served = serve(&realm, &alice);
+    let issuer = IdentityIssuer::new(alice.clone()).with_roster(served.roster.clone());
+    let now = craft_collab::now_ms();
+
+    // Two people, each invited for two seconds.
+    const SHORT_MS: u64 = 2_000;
+    let bobs = issuer.group_grant(DOC, &served.group, Some(bob.node_id()), SHORT_MS, now).expect("an invite for Bob");
+    let carols = issuer.group_grant(DOC, &served.group, Some(carol.node_id()), SHORT_MS, now).expect("an invite for Carol");
+    // Bob also holds a grant — the seam mints one with every invite, and a
+    // host may renew it — and it outlives the line. Carol holds none.
+    issuer.issue(DOC, bob.node_id(), Role::Editor, GROUP_CREDENTIAL_MS, now + SHORT_MS).expect("a live grant for Bob");
+    tokio::time::sleep(Duration::from_millis(SHORT_MS + 500)).await;
+
+    pull(&realm, &bob, &group(&served.group, &bobs, node32(&alice))).await.expect("the credential outlived the invite, so the key still comes");
+    let refused = pull(&realm, &carol, &group(&served.group, &carols, node32(&alice))).await.expect_err("a lapsed invite with no grant is nobody");
+    assert_eq!(refused.reason(), Some(Reason::NotAMember), "{refused}");
 }
 
 /// T3: revocation takes the key away — every epoch of it, past or current —

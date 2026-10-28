@@ -230,17 +230,20 @@ impl CraftMesh {
                 "{path}: a share's group is minted per session, so an instance that joins needs an invite line, not raw station and realm coordinates"
             ));
         }
-        // The host's own admission record: it answers the key distributor
-        // this share serves, and every grant, revocation and invite the
-        // session mints is written into it.
-        let roster = Roster::new(identity.node_id()).map_err(|e| format!("{path}: the share's admission record: {e}"))?;
+        // The share's group, minted here because the admission record is
+        // about exactly this prefix and no other (threat model T8): a holder
+        // of one share is nobody in another, even another of this host's.
+        let prefix = crate::mint_share_prefix(&cfg.realm_name, identity.node_id())?;
+        let roster = Roster::new(identity.node_id(), &prefix).map_err(|e| format!("{path}: the share's admission record: {e}"))?;
         let checks = roster.checks();
-        let mut config = mesh_config(&cfg.station, &cfg.realm, &cfg.realm_name, &cfg.realm_key, Share::default())?;
+        let share = Share { prefix: prefix.clone(), ..Share::default() };
+        let mut config = mesh_config(&cfg.station, &cfg.realm, &cfg.realm_name, &cfg.realm_key, share)?;
+        config.hosting = true;
         config.membership = Some(checks.membership);
         config.removed = Some(checks.removed);
         let transport = MeshTransport::connect(&config, &identity)?;
-        // The share this session carries: a host has just minted one, and the
-        // session needs it to put in every invite it mints from here on.
+        // The share this session carries: the session needs it to put in
+        // every invite it mints from here on.
         let share_group = transport.group_prefix().to_string();
         // A raw-coordinates config is the document owner's instance: it holds
         // the access table, mints grants and can invite.
@@ -412,6 +415,7 @@ fn mesh_config(seed: &str, realm: &str, realm_name: &str, realm_key: &str, share
         realm_key: hex_bytes(realm_key).map_err(|e| format!("realm key: {e}"))?,
         realm_name: realm_name.to_string(),
         share,
+        hosting: false,
         // A joiner serves nothing: the host's checks are set by the host path
         // that mints the share's group.
         membership: None,

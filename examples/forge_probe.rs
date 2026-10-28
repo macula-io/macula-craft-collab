@@ -40,6 +40,7 @@ fn main() {
         realm_key: Vec::new(),
         realm_name: "io.macula".into(),
         share: Share::default(),
+        hosting: true,
         // This probe is its own share's host: it serves the key distributor,
         // and the record of who may pull is its own.
         membership: None,
@@ -52,8 +53,9 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let checks = Roster::new(identity.node_id()).expect("the probe's admission record").checks();
-    let cfg = MeshConfig { membership: Some(checks.membership), removed: Some(checks.removed), ..cfg };
+    let prefix = macula_craft_collab::mint_share_prefix("io.macula", identity.node_id()).expect("a share prefix");
+    let checks = Roster::new(identity.node_id(), &prefix).expect("the probe's admission record").checks();
+    let cfg = MeshConfig { share: Share { prefix, ..Share::default() }, membership: Some(checks.membership), removed: Some(checks.removed), ..cfg };
     let mut mesh = match MeshTransport::connect(&cfg, &identity) {
         Ok(m) => m,
         Err(e) => {
