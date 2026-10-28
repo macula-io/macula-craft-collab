@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use craft_collab::{Kind, Message, Transport};
-use macula_craft_collab::{Identity, MeshConfig, MeshTransport};
+use macula_craft_collab::{Identity, MeshConfig, MeshTransport, Share};
 
 fn arg(i: usize) -> String {
     std::env::args().nth(i).unwrap_or_else(|| {
@@ -29,7 +29,15 @@ fn main() {
     let label = arg(5);
     let mode = arg(6);
 
-    let cfg = MeshConfig { host, port, station_node_id: station, realm_id: realm, realm_key: Vec::new() };
+    let cfg = MeshConfig {
+        host,
+        port,
+        station_node_id: station,
+        realm_id: realm,
+        realm_key: Vec::new(),
+        realm_name: "io.macula".into(),
+        share: Share::default(),
+    };
     let slug: String = label.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
     let identity = match Identity::load_or_create("pq_hybrid", &slug, &label) {
         Ok(identity) => identity,

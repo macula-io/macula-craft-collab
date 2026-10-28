@@ -148,6 +148,8 @@ mod tests {
             host_realm: None,
             invitee: None,
             invitee_name: None,
+            group: "io.macula/~aa/craft/9f9f9f9f".into(),
+            group_grant: "ucan-for-the-group".into(),
             signature: Vec::new(),
         };
         assert!(verify_invite(&invite).is_err(), "unsigned is refused");

@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 
 use craft_collab::{BodyParagraph, CollabSession, Role, ShareContext, TextStore};
 
-use crate::{Identity, IdentityIssuer, MeshConfig, MeshTransport, RealmCredential, RealmMemberVerifier, RealmTrust, Tier};
+use crate::{Identity, IdentityIssuer, MeshConfig, MeshTransport, RealmCredential, RealmMemberVerifier, RealmTrust, Share, Tier};
 
 /// The realm a fresh identity signs in to.
 pub const DEFAULT_REALM: &str = "io.macula";
@@ -219,7 +219,11 @@ impl CraftMesh {
         if cfg.station.is_empty() || cfg.realm.is_empty() {
             return Err(format!("{path}: station and realm are required without an invite"));
         }
-        let transport = MeshTransport::connect(&mesh_config(&cfg.station, &cfg.realm, &cfg.realm_key)?, &identity)?;
+        let transport =
+            MeshTransport::connect(&mesh_config(&cfg.station, &cfg.realm, &cfg.realm_name, &cfg.realm_key, Share::default())?, &identity)?;
+        // The share this session carries: a host has just minted one, and the
+        // session needs it to put in every invite it mints from here on.
+        let share_group = transport.group_prefix().to_string();
         // A raw-coordinates config is the document owner's instance: it holds
         // the access table, mints grants and can invite. `join` only says
         // whether it asks the peers for the document (a host restart reopens
@@ -246,7 +250,13 @@ impl CraftMesh {
             let verifier = share_verifier(realm, role, &cfg.realm, &cfg.realm_key, trust_path.as_deref()).map_err(|e| format!("{path}: {e}"))?;
             session.set_member_verifier(Box::new(verifier));
         }
-        session.set_share_context(ShareContext { realm: cfg.realm, realm_key: cfg.realm_key, seed: cfg.station, profile: cfg.profile });
+        session.set_share_context(ShareContext {
+            realm: cfg.realm,
+            realm_key: cfg.realm_key,
+            seed: cfg.station,
+            profile: cfg.profile,
+            group: share_group,
+        });
         if let Some(store) = person_file(&format!("{}.{}.grants.json", safe_slug(&cfg.identity), safe_slug(&cfg.doc))) {
             session.set_grants_store(Box::new(store));
         }
@@ -350,7 +360,22 @@ fn join_line(identity: &Identity, name: &str, line: &str) -> Result<CollabSessio
     if !invite.is_live(craft_collab::now_ms()) {
         return Err("this invite has expired".into());
     }
-    let transport = MeshTransport::connect(&mesh_config(&invite.seed, &invite.realm, &invite.realm_key)?, identity)?;
+    // A shared document travels sealed, so the invite must carry the share's
+    // group and the credential that pulls its key. An invite minted by a
+    // session that does not seal names neither, and joining it would put this
+    // person's edits in the open: refused, visibly, rather than joined.
+    if invite.group.is_empty() || invite.group_grant.is_empty() {
+        return Err("this invite is from a session that does not seal; ask the host for a fresh line".into());
+    }
+    // The host's node is the share's distributor, and the invite pins it: a
+    // node that advertises itself as the distributor instead is refused.
+    let realm_name = invite.group.split('/').next().unwrap_or_default().to_string();
+    let share = Share {
+        prefix: invite.group.clone(),
+        grant: invite.group_grant.clone().into_bytes(),
+        distributor: Some(hex32(&invite.host).map_err(|e| format!("the host's node id: {e}"))?),
+    };
+    let transport = MeshTransport::connect(&mesh_config(&invite.seed, &invite.realm, &realm_name, &invite.realm_key, share)?, identity)?;
     let mut session = CollabSession::join_requesting(&invite.doc, name, Box::new(transport), invite.token.clone(), membership);
     session.set_access(crate::verified_access_from(&invite.doc, &invite.host_key, &invite.profile)?);
     // The host is the first person this joiner meets: remember them (the
@@ -362,7 +387,7 @@ fn join_line(identity: &Identity, name: &str, line: &str) -> Result<CollabSessio
     Ok(session)
 }
 
-fn mesh_config(seed: &str, realm: &str, realm_key: &str) -> Result<MeshConfig, String> {
+fn mesh_config(seed: &str, realm: &str, realm_name: &str, realm_key: &str, share: Share) -> Result<MeshConfig, String> {
     let mut parts = seed.rsplitn(3, ':');
     let (Some(node_hex), Some(port), Some(host)) = (parts.next(), parts.next(), parts.next()) else {
         return Err("a station seed must be host:port:node_hex".into());
@@ -373,6 +398,8 @@ fn mesh_config(seed: &str, realm: &str, realm_key: &str) -> Result<MeshConfig, S
         station_node_id: hex32(node_hex).map_err(|e| format!("station node id: {e}"))?,
         realm_id: hex32(realm).map_err(|e| format!("realm: {e}"))?,
         realm_key: hex_bytes(realm_key).map_err(|e| format!("realm key: {e}"))?,
+        realm_name: realm_name.to_string(),
+        share,
     })
 }
 
@@ -525,8 +552,8 @@ mod tests {
         assert!(hex_bytes("abc").is_err());
         assert!(hex_bytes("zz").is_err());
         assert!(hex_bytes("éé").is_err());
-        assert!(mesh_config("no-colons", &"aa".repeat(32), "").is_err());
-        assert!(mesh_config("h:99999:aa", &"aa".repeat(32), "").is_err());
+        assert!(mesh_config("no-colons", &"aa".repeat(32), "io.macula", "", Share::default()).is_err());
+        assert!(mesh_config("h:99999:aa", &"aa".repeat(32), "io.macula", "", Share::default()).is_err());
         assert_eq!(safe_slug("a/b c"), "a_b_c");
     }
 }
