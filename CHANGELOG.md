@@ -39,11 +39,11 @@ than held for it.
   no subscriber then read. The wire acknowledges no PUBLISH, so neither this
   crate nor the pool can name that case.
 
-  The number is publications, not edits: this transport carries cursor moves
-  too. An edit is the case that matters — two copies then diverge and nobody
-  would otherwise be told — and an app knows which of its own publications the
-  person cares about, so it says that rather than telling them an edit was lost
-  when a cursor move was.
+  The number is publications, not edits: this transport carries cursor moves as
+  well as edits, and the count carries neither a kind nor a message id — so it
+  does not say which one was lost. An app should word it as "something you sent
+  may not have reached the others", not "your edit was lost". Telling the two
+  apart would take a per-kind counter, which is a 0.10 change, not this one.
 
 ### Fixed
 

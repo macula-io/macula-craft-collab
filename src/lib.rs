@@ -234,12 +234,13 @@ impl MeshTransport {
     /// [`Pool::unsent_publications`], counted there and read here.
     ///
     /// A non-zero count means a **publication** did not leave — this transport
-    /// carries cursor moves too, so it is not "an edit" by itself. An edit is
-    /// the case that matters: two copies then diverge and neither person would
-    /// otherwise be told (`waiting()` is set too when the reason is about the
-    /// share rather than the message). An app knows which of its own
-    /// publications the person cares about and says that, rather than telling
-    /// them an edit was lost when a cursor move was.
+    /// carries cursor moves as well as edits, and the number carries neither a
+    /// kind nor a message id, so it does not say which one was lost. An app
+    /// should word what it tells the person accordingly: "something you sent
+    /// may not have reached the others", not "your edit was lost". Telling the
+    /// two apart would take a per-kind counter, which this transport does not
+    /// keep (`waiting()` is set as well when the reason is about the share
+    /// rather than the message).
     ///
     /// What is *not* in it: a publication the station took and answered for,
     /// that no subscriber then read. The wire acknowledges no PUBLISH, so
