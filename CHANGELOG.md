@@ -34,6 +34,12 @@ Builds on macula-craft-seam 0.7.0 (released the same day).
   no subscriber then read. The wire acknowledges no PUBLISH, so neither this
   crate nor the pool can name that case.
 
+  The number is publications, not edits: this transport carries cursor moves
+  too. An edit is the case that matters — two copies then diverge and nobody
+  would otherwise be told — and an app knows which of its own publications the
+  person cares about, so it says that rather than telling them an edit was lost
+  when a cursor move was.
+
 ### Fixed
 
 - **An edit made while the path to the station loses every packet is no longer
