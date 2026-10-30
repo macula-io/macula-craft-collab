@@ -9,7 +9,7 @@ seam: it implements the seam's `Transport` over
 [macula-rust](https://crates.io/crates/macula-rust), and supplies what the
 seam leaves to an adapter.
 
-It tracks the released crates only: macula-rust 0.14 and macula-craft-seam 0.6.
+It tracks the released crates only: macula-rust 0.14 and macula-craft-seam 0.7.
 A node on this crate reaches stations on wire 1.0 and no others.
 
 - **Identity**: one persistent signing key per person per device (OS secure

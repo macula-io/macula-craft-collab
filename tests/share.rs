@@ -433,6 +433,52 @@ async fn a_publication_that_cannot_be_sealed_is_counted_and_never_sent_clear() {
     assert!(refused_publication_counted(&transport).await, "the refused publication is counted, not swallowed");
 }
 
+/// #39's app-side half: the count the transport keeps reaches the session an
+/// app holds, so a person is told their edit did not go out instead of
+/// watching it vanish without a word.
+///
+/// The share is the one above: pinned to a distributor that never answers, so
+/// every publication of the session is refused. Nothing about the document
+/// changes on this side either — the edit stays local, which is exactly the
+/// case the person has to be told about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_the_mesh_refused_is_reported_to_the_app_by_the_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let lab = Lab::start(PROFILE);
+    let realm = realm(&lab);
+    let bob = identity(dir.path(), "bob", "Bob");
+    let eve = identity(dir.path(), "eve", "Eve");
+    let share =
+        Share { prefix: format!("{REALM_NAME}/~{}/craft/0123456789abcdef", eve.node_id()), grant: Vec::new(), distributor: Some(node32(&eve)) };
+    let transport = MeshTransport::connect(&realm.config(REALM_NAME, share), &bob).expect("the transport waits rather than joining nothing");
+
+    let body = [BodyParagraph { para: PARA.into(), text: "Bob writes.".into(), props: None }];
+    let mut session = CollabSession::host(DOC, "Bob", Box::new(transport), &body);
+    assert_eq!(session.refused_publications(), 0, "nothing has been refused yet");
+
+    let update = session.texts_mut().local_edit(PARA, "Bob writes.", "Bob, offline.").expect("an edit");
+    session.send_text(PARA.to_string(), update, None);
+
+    // The refusal is decided on the transport's own thread, after the session
+    // has already returned from `send_text`.
+    assert!(session_reports_refusal(&mut session).await, "the edit that did not leave is not counted, so the app cannot tell the person");
+    let seen = session.refused_publications();
+    assert_eq!(session.stats()["unsent"].as_u64(), Some(seen), "the session's status carries the same count to the UI");
+}
+
+/// Whether the session an app holds reports a refused publication within a
+/// few seconds: what a UI would read to tell the person.
+async fn session_reports_refusal(session: &mut CollabSession) -> bool {
+    for _ in 0..50 {
+        let _ = session.tick();
+        if session.refused_publications() > 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
 // T8 — "a holder of share A is refused the key for share B" — is NOT tested
 // here, and cannot be yet: both shares of one host have the same org
 // (`~<host>`), and the wire names a distributor by `<org>/group_keys_v1`, so

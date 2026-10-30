@@ -5,14 +5,36 @@ All notable changes to this crate are documented here. Format follows
 so a minor version may carry a small breaking change where one was the right
 call.
 
-## [Unreleased]
+## [0.9.0] - 2026-10-30
+
+Builds on macula-craft-seam 0.7.0 (released the same day).
+
+### Added
+
+- **A person is told when an edit of theirs did not leave** (macula-craft-collab#39).
+  `MeshTransport` now implements the seam's `Transport::refused_publications()`
+  from the count it already kept, so it reaches the app: the session exposes
+  `refused_publications()` and `stats()` carries the same number as `unsent`.
+  A rise means an edit was never published — the share could not seal it, or no
+  link would take it — and the app can say so instead of the edit vanishing
+  without a word. What is counted is *unsent*, not *lost*: a message a lower
+  layer accepted and then dropped is not in this number.
 
 ### Fixed
 
 - **An edit made while the path to the station loses every packet is no longer
   lost when that link ends** (macula-craft-collab#38, macula-rust#57): needs
   macula-rust 0.14.1, which sends such a publication again on the next link,
-  or counts it in `Pool::unsent_publications`.
+  or counts it in `MeshTransport::refused_publications()`.
+
+### Changed
+
+- **macula-craft-seam 0.6 -> 0.7.0.** The seam's order buffer reports what it
+  is holding (`order: {held, gaps, stalled}` in `stats()`), recovers a stall
+  past its deadline through the snapshot path, and a snapshot that bypasses the
+  buffer now occupies its sequence position instead of opening a hole
+  (rgfaber/craft-libs#2). No API of this crate changed; `stats()` gains the
+  two keys.
 
 ## [0.8.0] - 2026-10-28
 

@@ -757,6 +757,10 @@ impl Transport for MeshTransport {
     fn membership(&self) -> Option<String> {
         self.membership.lock().ok()?.clone()
     }
+
+    fn refused_publications(&self) -> u64 {
+        self.arrivals.refused_outbound.load(Ordering::Relaxed)
+    }
 }
 
 /// The last segment of the topic a message's kind travels on.
