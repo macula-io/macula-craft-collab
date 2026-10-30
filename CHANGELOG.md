@@ -12,20 +12,35 @@ Builds on macula-craft-seam 0.7.0 (released the same day).
 ### Added
 
 - **A person is told when an edit of theirs did not leave** (macula-craft-collab#39).
-  `MeshTransport` now implements the seam's `Transport::refused_publications()`
-  from the count it already kept, so it reaches the app: the session exposes
-  `refused_publications()` and `stats()` carries the same number as `unsent`.
-  A rise means an edit was never published — the share could not seal it, or no
-  link would take it — and the app can say so instead of the edit vanishing
-  without a word. What is counted is *unsent*, not *lost*: a message a lower
-  layer accepted and then dropped is not in this number.
+  `MeshTransport::refused_publications()` — and through it the seam's
+  `Transport::refused_publications()`, so the session an app holds reports it as
+  `refused_publications()` and `stats()["unsent"]` — now adds up every way this
+  crate knows a publication did not go out:
+
+  1. **the mesh refused it** before anything was sent (the share could not seal
+     it, or no link would take it). Nothing is ever sent in the clear instead,
+     so this is counted in `publish_sealed` and never a message that became
+     readable;
+  2. **the transport could not even queue it**: `send` was asked after the mesh
+     thread had ended, or the message would not serialise. The seam ignores
+     `send`'s answer, so this is counted at the source or not at all;
+  3. **the pool accepted it and could not deliver it**
+     (`Pool::unsent_publications`, macula-rust 0.14.1): sent on a link that
+     ended before the station was known to have read it, and then not sent
+     again in time — no link came up before subscribers would have refused it,
+     the pool closed, or too many were already waiting.
+
+  What is **not** counted: a publication the station took and answered for that
+  no subscriber then read. The wire acknowledges no PUBLISH, so neither this
+  crate nor the pool can name that case.
 
 ### Fixed
 
 - **An edit made while the path to the station loses every packet is no longer
-  lost when that link ends** (macula-craft-collab#38, macula-rust#57): needs
-  macula-rust 0.14.1, which sends such a publication again on the next link,
-  or counts it in `MeshTransport::refused_publications()`.
+  lost when that link ends** (macula-craft-collab#38, macula-rust#57): macula-rust
+  0.14.1 sends such a publication again on the next link. When it cannot, the
+  pool counts it (`Pool::unsent_publications`) and this release carries that
+  count to the app, so the person hears about it instead of the edit vanishing.
 
 ### Changed
 

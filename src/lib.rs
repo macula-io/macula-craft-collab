@@ -144,6 +144,27 @@ pub struct MeshTransport {
     /// Why the share is not usable yet, when it is not: the key distributor
     /// has not answered, and every publication is refused until it does.
     waiting: Arc<Mutex<Option<Reason>>>,
+    /// What the pool that owns this transport's link counts as accepted and
+    /// not delivered ([`Pool::unsent_publications`]): the case where the
+    /// station took the publication but the link ended before it was known to
+    /// have read it, and no link took it again in time (macula-craft-collab#38).
+    /// Asked of the pool rather than copied, so the number is the pool's own.
+    pool_unsent: PoolUnsent,
+}
+
+/// How a transport asks its pool what it accepted and could not deliver. A
+/// closure, not the pool: the sum in
+/// [`MeshTransport::refused_publications`] then has a test that sets the
+/// number itself, instead of waiting out a publication's fifteen-minute
+/// acceptance window.
+type PoolUnsent = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// What the mesh thread hands back once the transport is ready to be used:
+/// the outbound channel, and the pool's own count for what it could not
+/// deliver.
+struct Ready {
+    out: UnboundedSender<Outbound>,
+    pool_unsent: PoolUnsent,
 }
 
 /// What became of the events a share's topics delivered that could not be
@@ -205,13 +226,23 @@ impl MeshTransport {
         self.arrivals.unusable.load(Ordering::Relaxed)
     }
 
-    /// How many of this node's own publications the mesh refused. Nothing is
-    /// ever sent in the clear instead, so a non-zero count means an edit did
-    /// not leave — the one case where two copies diverge and neither person
-    /// would otherwise be told (`waiting()` is set too when the reason is
-    /// about the share rather than the message).
+    /// How many of this node's own publications did not leave, from both
+    /// sources that know: what the mesh refused before anything was sent
+    /// (nothing is ever sent in the clear instead, so this is never a message
+    /// that became readable), and what the pool accepted and then could not
+    /// deliver because its link ended first — its own
+    /// [`Pool::unsent_publications`], counted there and read here.
+    ///
+    /// A non-zero count means an edit did not leave — the one case where two
+    /// copies diverge and neither person would otherwise be told (`waiting()`
+    /// is set too when the reason is about the share rather than the
+    /// message).
+    ///
+    /// What is *not* in it: a publication the station took and answered for,
+    /// that no subscriber then read. The wire acknowledges no PUBLISH, so
+    /// nothing here or in the pool can name that case.
     pub fn refused_publications(&self) -> u64 {
-        self.arrivals.refused_outbound.load(Ordering::Relaxed)
+        self.arrivals.refused_outbound.load(Ordering::Relaxed) + (self.pool_unsent)()
     }
 
     /// The share's group prefix: the host's minted one, or the one an invite
@@ -303,7 +334,9 @@ impl MeshTransport {
             })
             .map_err(|e| format!("thread: {e}"))?;
         match ready_rx.recv() {
-            Ok(Ok(out)) => Ok(MeshTransport { author, prefix, out, incoming: in_rx, dropped_unverified: dropped, arrivals, membership, waiting }),
+            Ok(Ok(Ready { out, pool_unsent })) => {
+                Ok(MeshTransport { author, prefix, out, incoming: in_rx, dropped_unverified: dropped, arrivals, membership, waiting, pool_unsent })
+            }
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("the mesh thread ended before it was ready: {e}")),
         }
@@ -404,7 +437,7 @@ struct MeshThread {
     key: Arc<NodeKey>,
     identity: Identity,
     group: Group,
-    ready: std::sync::mpsc::Sender<Result<UnboundedSender<Outbound>, String>>,
+    ready: std::sync::mpsc::Sender<Result<Ready, String>>,
     dropped: Arc<AtomicU64>,
     arrivals: Arrivals,
     membership: Arc<Mutex<Option<String>>>,
@@ -421,7 +454,7 @@ fn run_on_new_runtime(
     identity: Identity,
     group: Group,
     in_tx: Sender<Message>,
-    ready: std::sync::mpsc::Sender<Result<UnboundedSender<Outbound>, String>>,
+    ready: std::sync::mpsc::Sender<Result<Ready, String>>,
     dropped: Arc<AtomicU64>,
     arrivals: Arrivals,
     membership: Arc<Mutex<Option<String>>>,
@@ -498,7 +531,13 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
         return;
     }
     // The transport holds the only sender; when it drops, the channel ends.
-    let _ = ready.send(Ok(out_tx));
+    // The pool's own count travels with it: what the pool accepted and could
+    // not deliver is part of what an app is told (macula-craft-collab#38).
+    let pool_unsent: PoolUnsent = {
+        let pool = pool.clone();
+        Arc::new(move || pool.unsent_publications())
+    };
+    let _ = ready.send(Ok(Ready { out: out_tx, pool_unsent }));
 
     let realm = cfg.realm_id;
     while let Some(out) = out_rx.recv().await {
@@ -746,8 +785,21 @@ impl Transport for MeshTransport {
     fn send(&mut self, msg: Message) -> Result<(), String> {
         let name = name_for(&msg.kind);
         let topic = topic_of(&self.prefix, name);
-        let json = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-        self.out.send(Outbound::Publish(topic, json)).map_err(|_| "the mesh link has ended".to_string())
+        // Asked to send and could not, for either reason: serialisation, or
+        // the mesh thread gone (its channel is closed once it has ended).
+        // The seam ignores this answer, so counting it here is the only way
+        // the app is told (macula-craft-collab#39).
+        let json = match serde_json::to_string(&msg) {
+            Ok(json) => json,
+            Err(e) => {
+                self.arrivals.refused_outbound.fetch_add(1, Ordering::Relaxed);
+                return Err(e.to_string());
+            }
+        };
+        self.out.send(Outbound::Publish(topic, json)).map_err(|_| {
+            self.arrivals.refused_outbound.fetch_add(1, Ordering::Relaxed);
+            "the mesh link has ended".to_string()
+        })
     }
 
     fn poll(&mut self) -> Vec<Message> {
@@ -759,7 +811,9 @@ impl Transport for MeshTransport {
     }
 
     fn refused_publications(&self) -> u64 {
-        self.arrivals.refused_outbound.load(Ordering::Relaxed)
+        // The same number an app holding the transport reads directly: two
+        // sources, one answer.
+        MeshTransport::refused_publications(self)
     }
 }
 
@@ -826,6 +880,57 @@ mod tests {
 
     fn arriving() -> (Sender<Message>, Receiver<Message>) {
         std::sync::mpsc::channel()
+    }
+
+    /// A transport whose outbound channel is `out`, with the pool's count
+    /// answered by `pool_unsent`: everything the two tests below need, and
+    /// nothing that dials a station.
+    fn transport_with(out: UnboundedSender<Outbound>, pool_unsent: PoolUnsent) -> MeshTransport {
+        let (_in_tx, incoming) = arriving();
+        MeshTransport {
+            author: "aabbcc".into(),
+            prefix: "io.macula/~aabbcc/craft/9f9f".into(),
+            out,
+            incoming,
+            dropped_unverified: Arc::new(AtomicU64::new(0)),
+            arrivals: Arrivals::default(),
+            membership: Arc::new(Mutex::new(None)),
+            waiting: Arc::new(Mutex::new(None)),
+            pool_unsent,
+        }
+    }
+
+    fn a_message(author: &str) -> Message {
+        Message { doc: "demo".into(), author: author.into(), epoch: 1, seq: 1, sent_at_ms: 0, kind: Kind::CursorMoved { position: None, name: None } }
+    }
+
+    /// #39, first source: what the pool accepted and could not deliver
+    /// because the link ended first is part of the number the app reads
+    /// (macula-craft-collab#38). The pool's own counter is macula-rust's to
+    /// test; what this asserts is that this crate adds it, beside its own.
+    #[test]
+    fn what_the_pool_could_not_deliver_is_counted_beside_what_the_mesh_refused() {
+        let (out, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let transport = transport_with(out, Arc::new(|| 3));
+        transport.arrivals.refused_outbound.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(transport.refused_publications(), 5, "the app's number is the pool's count plus the mesh's refusals");
+        drop(out_rx);
+    }
+
+    /// #39, second source: an edit the transport is asked to send after the
+    /// mesh side has ended cannot be sent, and is counted rather than lost
+    /// without a word. The seam ignores `send`'s answer, so this is the only
+    /// place it can be counted.
+    #[test]
+    fn a_send_after_the_mesh_side_ended_is_counted() {
+        let (out, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        // The mesh thread has ended: its receiving half is gone, exactly as
+        // when the transport loop returns and drops it.
+        drop(out_rx);
+        let mut transport = transport_with(out, Arc::new(|| 0));
+        assert_eq!(transport.refused_publications(), 0, "nothing has been asked of it yet");
+        transport.send(a_message("aabbcc")).expect_err("the mesh side is gone, so the edit cannot be sent");
+        assert_eq!(transport.refused_publications(), 1, "an edit the app asked to send and could not is counted, not swallowed");
     }
 
     fn publishable(json: &str) -> Payload {
