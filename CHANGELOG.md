@@ -5,6 +5,15 @@ All notable changes to this crate are documented here. Format follows
 so a minor version may carry a small breaking change where one was the right
 call.
 
+## [Unreleased]
+
+### Fixed
+
+- **An edit made while the path to the station loses every packet is no longer
+  lost when that link ends** (macula-craft-collab#38, macula-rust#57): needs
+  macula-rust 0.14.1, which sends such a publication again on the next link,
+  or counts it in `Pool::unsent_publications`.
+
 ## [0.8.0] - 2026-10-28
 
 A shared document is readable only by its holders (macula-craft-collab#26).
