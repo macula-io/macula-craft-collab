@@ -20,11 +20,18 @@ call.
   is `Unverified`, which a sweep treats as failure: the record's echo proves a
   station took it, never that the aggregate acted.
 - **`MACULA_CRAFT_RESIGN_ON_SHUTDOWN=1`** resigns every held membership when a
-  transport stops, after stopping the renewal loop and waiting for it, so no
-  renewal can mint a membership back. Off by default: a person closing an app
+  transport stops. The renewal loop is stopped and waited for first, on both
+  the explicit path and the shutdown path, so no renewal can mint a membership
+  back; and the mesh thread is now joined in `Drop`, so an app that drops its
+  transport finishes the teardown instead of the process exiting on top of it. Off by default: a person closing an app
   must not leave their realm, and only a test sweep sets it. Ended
   memberships' stored credentials are forgotten, so a later start cannot renew
   one back into admitted.
+- **Two edges of the read are handled explicitly**: a membership already ended
+  before the run forgets its stored credential instead of renewing it back on
+  the next start, and a realm whose admission moment is ahead of this machine's
+  clock is refused rather than published against as a record the realm would
+  read as stale.
 - **`harness/run.sh`** runs one sweep against one realm — the realm named once
   and exported as the realm the app joins and auto-joins, `io.macula` refused
   outright (macula-craft-collab#41) — and tears the run down on both paths

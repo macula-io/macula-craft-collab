@@ -37,8 +37,9 @@
 use std::time::Duration;
 
 use macula_rust::cbor::Value;
-use macula_rust::pool::{Call, Pool};
+use macula_rust::pool::Pool;
 use macula_rust::record::{self, Record};
+use serde_json::{Value as Json, json};
 
 use super::realm_id_of;
 use crate::identity::Identity;
@@ -47,15 +48,13 @@ use crate::identity::Identity;
 pub const RESIGN_RECORD_TYPE: u8 = 0x21;
 
 /// The realm procedure a device proves itself to when it asks about its own
-/// membership. The realm allowlists the procedures a proof may carry
-/// (`macula_realm.membership_ucan`, `macula_realm.join_session`), so this one
-/// is usable once the realm adds it (macula-realm#167).
-pub const READ_MEMBERSHIP_PROCEDURE: &str = "macula_realm.read_membership";
+/// membership (macula-realm#167). The realm allowlists the procedures a proof
+/// may carry, so this one is usable once the realm serves it.
+pub const READ_MEMBERSHIP_PROCEDURE: &str = "macula_realm.read_realm_membership";
 
-/// The identity-service path that procedure is served at
-/// (`<realm>/_realm/_realm/identity/read_realm_membership_v1`). The proof tag
-/// and the path are different strings on purpose, as the realm has them.
-pub const READ_MEMBERSHIP_PATH: &str = "read_realm_membership_v1";
+/// Where the realm serves that read: its member-facing host, the body
+/// `{realm_id, member_did, proof}` (macula-realm#167).
+pub const READ_MEMBERSHIP_PATH: &str = "/api/v1/memberships/status";
 
 /// How long a resignation waits for the realm to answer that the row ended.
 /// The listener polls every 30 seconds, so this leaves several polls.
@@ -137,53 +136,53 @@ pub fn resign_record(identity: &Identity, realm_name: &str, resigned_at_ms: u64)
 
 /// The realm's answer, parsed: what it holds about this node's membership.
 ///
-/// An answer naming no status, a status this crate does not know, or an ended
-/// membership with no admission moment is an **error**, not an `Absent`: a
-/// sweep must never read "I could not tell" as "there is nothing there".
-pub fn status_from_reply(reply: &Value) -> Result<MembershipStatus, String> {
-    let status = text_field(reply, "status").ok_or("the realm answered no membership status")?;
+/// A non-2xx answer is an **error**, not an `Absent`: the realm answers 503 for
+/// a projection it cannot read precisely so a sweep never reads "I could not
+/// tell" as "there is nothing there" (macula-realm#167). An answer naming no
+/// status, a status this crate does not know, or an ended membership with no
+/// admission moment is an error for the same reason.
+pub fn parse_status(status_code: i32, body: &str) -> Result<MembershipStatus, String> {
+    if !(200..300).contains(&status_code) {
+        return Err(format!("the realm answered HTTP {status_code}: {body}"));
+    }
+    let answer: Json = serde_json::from_str(body).map_err(|e| format!("the realm answered no JSON: {e}"))?;
+    status_from_answer(&answer)
+}
+
+/// [`parse_status`] on an already-parsed answer. Pure.
+fn status_from_answer(answer: &Json) -> Result<MembershipStatus, String> {
+    let status = text(answer, "status").ok_or("the realm answered no membership status")?;
     match status.as_str() {
-        "admitted" => admitted_at(reply).map(|admitted_at_ms| MembershipStatus::Admitted { admitted_at_ms }),
-        "resigned" => ended_from(reply, EndKind::Resigned),
-        "revoked" => ended_from(reply, EndKind::Revoked),
+        "admitted" => admitted_at(answer).map(|admitted_at_ms| MembershipStatus::Admitted { admitted_at_ms }),
+        "resigned" => ended_from(answer, EndKind::Resigned),
+        "revoked" => ended_from(answer, EndKind::Revoked),
         "absent" => Ok(MembershipStatus::Absent),
         other => Err(format!("the realm answered an unknown membership status {other:?}")),
     }
 }
 
 /// The moment a membership was admitted, which every answered status carries.
-fn admitted_at(reply: &Value) -> Result<u64, String> {
-    int_field(reply, "admitted_at").ok_or_else(|| "the realm answered no admitted_at".to_string())
+fn admitted_at(answer: &Json) -> Result<u64, String> {
+    moment(answer, "admitted_at").ok_or_else(|| "the realm answered no admitted_at".to_string())
 }
 
 /// An ended membership: the admission moment it ended, and how.
-fn ended_from(reply: &Value, kind: EndKind) -> Result<MembershipStatus, String> {
-    let admitted_at_ms = admitted_at(reply)?;
-    let ended_at = int_field(reply, "resigned_at").or_else(|| int_field(reply, "revoked_at"));
-    Ok(MembershipStatus::Ended { kind, admitted_at_ms, ended_at_ms: ended_at })
+fn ended_from(answer: &Json, kind: EndKind) -> Result<MembershipStatus, String> {
+    let admitted_at_ms = admitted_at(answer)?;
+    let ended_at_ms = moment(answer, "resigned_at").or_else(|| moment(answer, "revoked_at"));
+    Ok(MembershipStatus::Ended { kind, admitted_at_ms, ended_at_ms })
 }
 
-/// A text field of a CBOR map, read whatever key form it arrived in: the
-/// wire carries text keys, and a double-hex-wrapped value is unwrapped by
-/// [`super::unwrap_text_field`].
-fn text_field(value: &Value, key: &str) -> Option<String> {
-    super::unwrap_text_field(field(value, key)?)
+/// A text field of the realm's answer.
+fn text(answer: &Json, name: &str) -> Option<String> {
+    answer.get(name).and_then(Json::as_str).map(str::to_string)
 }
 
-/// An integer field of a CBOR map. A value sent as text is refused rather than
-/// parsed: the realm's answer is the realm's, and a shape this crate did not
-/// ask for is not one to guess at.
-fn int_field(value: &Value, key: &str) -> Option<u64> {
-    match field(value, key)? {
-        Value::Int(i) => u64::try_from(*i).ok(),
-        _ => None,
-    }
-}
-
-/// One field of a CBOR map by text key.
-fn field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-    let Value::Map(entries) = value else { return None };
-    entries.iter().find(|(k, _)| matches!(k, Value::Text(t) if t == key)).map(|(_, v)| v)
+/// A moment of the realm's answer, in milliseconds. A value sent as text is
+/// refused rather than parsed: a shape this crate did not ask for is not one
+/// to guess at.
+fn moment(answer: &Json, name: &str) -> Option<u64> {
+    answer.get(name).and_then(Json::as_i64).and_then(|ms| u64::try_from(ms).ok())
 }
 
 /// Whether the ended answer is about the membership this call pinned.
@@ -216,17 +215,39 @@ pub fn outcome_for(realm: &str, pinned: &MembershipStatus, answer: &MembershipSt
 /// that row ended. A membership that is not there is not published for: there
 /// is nothing to end, and the outcome says so.
 pub async fn resign_one(pool: &Pool, identity: &Identity, realm_name: &str, deadline: Duration) -> ResignOutcome {
-    let pinned = match read_membership(pool, identity, realm_name, super::now_ms()).await {
+    let pinned = match read_membership(identity, realm_name, super::now_ms()).await {
         Ok(status) => status,
         Err(why) => return ResignOutcome::Unverified { realm: realm_name.to_string(), why: format!("reading the membership first: {why}") },
     };
-    if !matches!(pinned, MembershipStatus::Admitted { .. }) {
-        return ResignOutcome::Unverified { realm: realm_name.to_string(), why: format!("nothing to end: the realm answers {pinned:?}") };
+    let now_ms = super::now_ms();
+    match pinned {
+        // An earlier run ended this membership and died before forgetting the
+        // credential. Nothing is ended now, and the credential goes: left in
+        // place it is what the next start would renew, and renewing re-admits.
+        MembershipStatus::Ended { .. } => {
+            super::forget_credential(identity.node_id(), realm_name);
+            ResignOutcome::Unverified { realm: realm_name.to_string(), why: "already ended before this run: nothing was ended now".into() }
+        }
+        // `absent` is red, not "nothing to do": the realm erases rows
+        // (reprojection, the test realm's reset), so an absent answer is also
+        // what a mis-keyed resignation looks like.
+        MembershipStatus::Absent => {
+            ResignOutcome::Unverified { realm: realm_name.to_string(), why: "the realm answers absent: no row to end".into() }
+        }
+        // A realm clock ahead of this one would make the record's signed
+        // moment older than the admission it is meant to end, and the realm
+        // refuses that as stale. Waiting is not this call's business.
+        MembershipStatus::Admitted { admitted_at_ms } if admitted_at_ms > now_ms => ResignOutcome::Unverified {
+            realm: realm_name.to_string(),
+            why: format!("the realm admits this membership at {admitted_at_ms}, ahead of this machine's clock ({now_ms})"),
+        },
+        pinned @ MembershipStatus::Admitted { .. } => {
+            if let Err(why) = publish(pool, identity, realm_name, now_ms).await {
+                return ResignOutcome::Unverified { realm: realm_name.to_string(), why };
+            }
+            await_end(identity, realm_name, pinned, deadline).await
+        }
     }
-    if let Err(why) = publish(pool, identity, realm_name, super::now_ms()).await {
-        return ResignOutcome::Unverified { realm: realm_name.to_string(), why };
-    }
-    await_end(pool, identity, realm_name, pinned, deadline).await
 }
 
 /// Builds, signs and puts one fresh resignation record.
@@ -239,10 +260,10 @@ async fn publish(pool: &Pool, identity: &Identity, realm_name: &str, now_ms: u64
 /// Polls the realm until the pinned row is answered ended, or the deadline
 /// passes. A row still admitted is waited for; every other answer is decided
 /// by [`outcome_for`].
-async fn await_end(pool: &Pool, identity: &Identity, realm_name: &str, pinned: MembershipStatus, deadline: Duration) -> ResignOutcome {
+async fn await_end(identity: &Identity, realm_name: &str, pinned: MembershipStatus, deadline: Duration) -> ResignOutcome {
     let started = std::time::Instant::now();
     loop {
-        let answer = read_membership(pool, identity, realm_name, super::now_ms()).await;
+        let answer = read_membership(identity, realm_name, super::now_ms()).await;
         if let Ok(answer) = &answer
             && let Some(outcome) = outcome_for(realm_name, &pinned, answer)
         {
@@ -260,27 +281,32 @@ async fn await_end(pool: &Pool, identity: &Identity, realm_name: &str, pinned: M
 
 /// Asks the realm what it holds about this node's membership of `realm_name`:
 /// a device-signed read of the caller's own row (macula-realm#167).
-pub async fn read_membership(pool: &Pool, identity: &Identity, realm_name: &str, now_ms: u64) -> Result<MembershipStatus, String> {
-    let realm_id = realm_id_of(realm_name);
-    let request = Value::Map(vec![(Value::text("member_did"), Value::text(identity.node_id()))]);
-    let proof = identity.device_request_proof(&realm_id, READ_MEMBERSHIP_PROCEDURE, &request, now_ms)?;
-    let payload = Value::Map(vec![(Value::text("member_did"), Value::text(identity.node_id())), (Value::text("proof"), proof.to_cbor())]);
-    let procedure = super::realm_identity_procedure(realm_name, READ_MEMBERSHIP_PATH);
-    let call = Call {
-        realm: realm_id,
-        procedure,
-        provider: [0; 32],
-        payload,
-        timeout: Duration::from_secs(8),
-        token: None,
-        proofs: Vec::new(),
-        confidential: Default::default(),
-    };
-    let reply = pool.call(call).await.map_err(|e| format!("read_realm_membership: {e:?}"))?;
-    if let Some(error) = reply.get("error").and_then(super::unwrap_text_field) {
-        return Err(format!("read_realm_membership refused: {error}"));
-    }
-    status_from_reply(&reply)
+pub async fn read_membership(identity: &Identity, realm_name: &str, now_ms: u64) -> Result<MembershipStatus, String> {
+    let identity = identity.clone();
+    let realm_name = realm_name.to_string();
+    // The realm's transport is blocking; the transport's own runtime is not
+    // this call's to stall for ten seconds.
+    tokio::task::spawn_blocking(move || post_status(&realm_name, &identity, now_ms)).await.map_err(|e| format!("membership read: {e}"))?
+}
+
+/// One blocking POST of the proof-signed membership read. The signed body is
+/// `{realm_id, member_did}`, so the realm a read is about is inside the proof
+/// and cannot be swapped for another on the way.
+pub fn post_status(realm_name: &str, identity: &Identity, now_ms: u64) -> Result<MembershipStatus, String> {
+    let body = json!({"realm_id": realm_name, "member_did": identity.node_id()});
+    let request = super::proof::canonical_json(&body)?;
+    let proof = identity.device_request_proof(&realm_id_of(realm_name), READ_MEMBERSHIP_PROCEDURE, &request, now_ms)?;
+    let signed = json!({"realm_id": realm_name, "member_did": identity.node_id(), "proof": proof.to_json()});
+    let url = format!("{}{}", super::session::realm_base_url(realm_name), READ_MEMBERSHIP_PATH);
+    let res = minreq::post(&url)
+        .with_header("content-type", "application/json")
+        .with_header("accept", "application/json")
+        .with_body(signed.to_string())
+        .with_timeout(10)
+        .send()
+        .map_err(|e| format!("{url}: {e}"))?;
+    let text = res.as_str().map_err(|e| format!("{url}: {e}"))?;
+    parse_status(i32::from(res.status_code), text)
 }
 
 /// Resigns every membership this node holds: every realm in
@@ -318,6 +344,26 @@ mod tests {
         Identity::load_or_create_at(PROFILE, "resign-test", "Resign", &dir).expect("identity")
     }
 
+    /// A text field of the record's CBOR payload.
+    fn payload_text(payload: &Value, key: &str) -> Option<String> {
+        let Value::Map(entries) = payload else { return None };
+        let (_, value) = entries.iter().find(|(k, _)| matches!(k, Value::Text(t) if t == key))?;
+        match value {
+            Value::Text(t) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    /// An integer field of the record's CBOR payload.
+    fn payload_int(payload: &Value, key: &str) -> Option<i128> {
+        let Value::Map(entries) = payload else { return None };
+        let (_, value) = entries.iter().find(|(k, _)| matches!(k, Value::Text(t) if t == key))?;
+        match value {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        }
+    }
+
     #[test]
     fn the_record_is_a_signed_0x21_naming_the_realm_and_the_member() {
         let identity = identity();
@@ -325,9 +371,9 @@ mod tests {
         assert_eq!(record.record_type.0, RESIGN_RECORD_TYPE);
         assert!(record.created_at > 1_000_000_000_000, "the envelope stamps its own moment");
         assert!(record.expires_at > record.created_at, "a record with no life would be refused");
-        assert_eq!(text_field(&record.payload, "realm_id").as_deref(), Some("net.beam-campus"));
-        assert_eq!(text_field(&record.payload, "member_did"), Some(identity.node_id().to_string()));
-        assert_eq!(int_field(&record.payload, "resigned_at"), Some(1_760_000_000_000));
+        assert_eq!(payload_text(&record.payload, "realm_id").as_deref(), Some("net.beam-campus"));
+        assert_eq!(payload_text(&record.payload, "member_did"), Some(identity.node_id().to_string()));
+        assert_eq!(payload_int(&record.payload, "resigned_at"), Some(1_760_000_000_000));
         let wire = record::encode(&record).expect("wire");
         let verified = record::verify(&wire, identity.profile(), record.created_at as i64).expect("the record verifies");
         assert_eq!(verified.record().record_type.0, RESIGN_RECORD_TYPE);
@@ -339,7 +385,7 @@ mod tests {
         let other_dir = tempfile::tempdir().expect("dir").keep();
         let other = Identity::load_or_create_at(PROFILE, "resign-other", "Other", &other_dir).expect("identity");
         let record = resign_record(&identity, "net.beam-campus", 1_760_000_000_000).expect("record");
-        let named = text_field(&record.payload, "member_did").expect("member_did");
+        let named = payload_text(&record.payload, "member_did").expect("member_did");
         assert_ne!(named, other.node_id(), "another key's record names another member: the realm's signer check has something to refuse");
         let mut tampered = record::encode(&record).expect("wire");
         let last = tampered.len() - 1;
@@ -349,22 +395,22 @@ mod tests {
 
     #[test]
     fn the_realm_answers_parse_and_an_unreadable_answer_is_an_error_not_an_absence() {
-        let answer = |entries: Vec<(&str, Value)>| Value::Map(entries.into_iter().map(|(k, v)| (Value::text(k), v)).collect());
-        let admitted = answer(vec![("status", Value::text("admitted")), ("admitted_at", Value::Int(1_000))]);
-        assert_eq!(status_from_reply(&admitted), Ok(MembershipStatus::Admitted { admitted_at_ms: 1_000 }));
-        let resigned = answer(vec![("status", Value::text("resigned")), ("admitted_at", Value::Int(1_000)), ("resigned_at", Value::Int(2_000))]);
-        assert_eq!(
-            status_from_reply(&resigned),
-            Ok(MembershipStatus::Ended { kind: EndKind::Resigned, admitted_at_ms: 1_000, ended_at_ms: Some(2_000) })
-        );
-        let revoked = answer(vec![("status", Value::text("revoked")), ("admitted_at", Value::Int(1_000))]);
-        assert_eq!(status_from_reply(&revoked), Ok(MembershipStatus::Ended { kind: EndKind::Revoked, admitted_at_ms: 1_000, ended_at_ms: None }));
-        assert_eq!(status_from_reply(&answer(vec![("status", Value::text("absent"))])), Ok(MembershipStatus::Absent));
-        assert!(status_from_reply(&answer(vec![("status", Value::text("error"))])).is_err(), "an unknown status is not absent");
-        assert!(status_from_reply(&answer(vec![])).is_err(), "no status is not absent");
-        assert!(status_from_reply(&answer(vec![("status", Value::text("resigned"))])).is_err(), "an ended answer without its moment is not readable");
-        let text_moment = answer(vec![("status", Value::text("admitted")), ("admitted_at", Value::text("yesterday"))]);
-        assert!(status_from_reply(&text_moment).is_err(), "a moment the realm sent as text is not parsed into one");
+        let ok = |body: &str| parse_status(200, body);
+        let admitted = ok(r#"{"status":"admitted","admitted_at":1000}"#);
+        assert_eq!(admitted, Ok(MembershipStatus::Admitted { admitted_at_ms: 1_000 }));
+        let resigned = ok(r#"{"status":"resigned","admitted_at":1000,"resigned_at":2000}"#);
+        assert_eq!(resigned, Ok(MembershipStatus::Ended { kind: EndKind::Resigned, admitted_at_ms: 1_000, ended_at_ms: Some(2_000) }));
+        let revoked = ok(r#"{"status":"revoked","admitted_at":1000,"revoked_at":3000}"#);
+        assert_eq!(revoked, Ok(MembershipStatus::Ended { kind: EndKind::Revoked, admitted_at_ms: 1_000, ended_at_ms: Some(3_000) }));
+        assert_eq!(ok(r#"{"status":"absent"}"#), Ok(MembershipStatus::Absent));
+        assert!(ok(r#"{"status":"error"}"#).is_err(), "an unknown status is not absent");
+        assert!(ok(r#"{}"#).is_err(), "no status is not absent");
+        assert!(ok(r#"{"status":"resigned"}"#).is_err(), "an ended answer without its moment is not readable");
+        assert!(ok(r#"{"status":"admitted","admitted_at":"yesterday"}"#).is_err(), "a moment sent as text is not parsed into one");
+        assert!(ok("not json").is_err(), "a body that is not JSON is an error");
+        for code in [401, 403, 404, 503] {
+            assert!(parse_status(code, r#"{"status":"absent"}"#).is_err(), "HTTP {code} is an error even when the body says absent");
+        }
     }
 
     #[test]

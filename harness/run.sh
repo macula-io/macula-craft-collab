@@ -22,6 +22,13 @@
 # `<control port>:<key file>`. The teardown asks each of them to resign; an
 # instance that cannot be reached is a failed sweep, because a membership
 # nobody ended is exactly the row this exists to prevent.
+#
+# THE DRIVER MUST LEAVE ITS INSTANCES RUNNING when it returns. An instance the
+# driver has already closed has no control port left to ask, and the teardown
+# would report it as failed while it may have resigned cleanly — a driver that
+# stops its own instances is not a sweep this can tear down. The shutdown hook
+# (MACULA_CRAFT_RESIGN_ON_SHUTDOWN, set below) covers the other order: a driver
+# that died, or an instance killed mid-run still resigns when it does exit.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 

@@ -19,11 +19,17 @@ Runs a driver against **one** realm and tears the run down on both paths.
 - The same name is exported as `MACULA_CRAFT_AUTOJOIN_REALM`, so the app's
   silent auto-join targets the sweep's realm and not a realm of its own
   choosing.
-- `MACULA_CRAFT_RESIGN_ON_SHUTDOWN=1` is set: an instance that exits on its own
-  resigns before its transport closes.
+- `MACULA_CRAFT_RESIGN_ON_SHUTDOWN=1` is set, so an instance that exits — a
+  driver that died, an operator closing one — resigns before its transport
+  closes. That is the second line of defence, not the first.
 - After the driver exits, on **either** path, `teardown.py` resigns every
   listed instance. A teardown failure fails the sweep even when the driver
   passed, and the exit code says which happened.
+- **The driver must leave its instances running when it returns.** Teardown
+  reaches them over their control ports, and an instance the driver has
+  already closed cannot be asked. A driver that stops its own instances turns
+  every sweep red, because an unanswered instance is indistinguishable from
+  one that left a row.
 
 ## `teardown.py`
 

@@ -133,7 +133,14 @@ pub struct MeshTransport {
     /// The share's group prefix: what this node carries, whether it minted it
     /// or was given it by an invite.
     prefix: String,
-    out: UnboundedSender<Outbound>,
+    /// The mesh thread's inbound work channel. `None` once the transport has
+    /// been closed, which is what lets [`MeshTransport`]'s `Drop` end the
+    /// thread before the process leaves.
+    out: Option<UnboundedSender<Outbound>>,
+    /// The mesh thread itself, kept so the shutdown path can be waited for:
+    /// a detached thread would be killed by the process exiting, taking an
+    /// unproven resignation with it (macula-craft-collab#35).
+    thread: Option<std::thread::JoinHandle<()>>,
     incoming: Receiver<Message>,
     /// Messages dropped because their claimed author was not the verified
     /// publisher (a forged envelope author).
@@ -326,7 +333,7 @@ impl MeshTransport {
         let membership_in_thread = membership.clone();
         let waiting = Arc::new(Mutex::new(None));
         let waiting_in_thread = waiting.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("macula-craft-collab".into())
             .spawn(move || {
                 run_on_new_runtime(
@@ -344,12 +351,26 @@ impl MeshTransport {
                 );
             })
             .map_err(|e| format!("thread: {e}"))?;
+        let parts =
+            TransportParts { author, prefix, thread: Some(thread), incoming: in_rx, dropped_unverified: dropped, arrivals, membership, waiting };
         match ready_rx.recv() {
-            Ok(Ok(Ready { out, pool_unsent })) => {
-                Ok(MeshTransport { author, prefix, out, incoming: in_rx, dropped_unverified: dropped, arrivals, membership, waiting, pool_unsent })
-            }
+            Ok(Ok(ready)) => Ok(MeshTransport::from_ready(ready, parts)),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("the mesh thread ended before it was ready: {e}")),
+        }
+    }
+}
+
+impl Drop for MeshTransport {
+    /// Closes the work channel and **waits for the mesh thread**, so the
+    /// transport's shutdown path — ending the memberships it held, when a
+    /// sweep asked for that — finishes before the process can leave. A
+    /// detached thread is killed on exit and would take an unproven
+    /// resignation with it, silently (macula-craft-collab#35 r1).
+    fn drop(&mut self) {
+        drop(self.out.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -424,14 +445,52 @@ async fn serve_distributor(
     pool.serve(distributor.offer(cfg.realm_id, org_key_id)).await.map_err(|e| format!("the share's key distributor was not served: {e:?}"))
 }
 
+/// What [`MeshTransport::connect`] hands the transport that the mesh thread
+/// does not: everything it learned before the thread was started.
+struct TransportParts {
+    author: String,
+    prefix: String,
+    thread: Option<std::thread::JoinHandle<()>>,
+    incoming: Receiver<Message>,
+    dropped_unverified: Arc<AtomicU64>,
+    arrivals: Arrivals,
+    membership: Arc<Mutex<Option<String>>>,
+    waiting: Arc<Mutex<Option<Reason>>>,
+}
+
 impl MeshTransport {
+    /// The transport a ready mesh thread's channel makes, over the parts this
+    /// side already holds.
+    fn from_ready(ready: Ready, parts: TransportParts) -> MeshTransport {
+        MeshTransport {
+            author: parts.author,
+            prefix: parts.prefix,
+            out: Some(ready.out),
+            thread: parts.thread,
+            incoming: parts.incoming,
+            dropped_unverified: parts.dropped_unverified,
+            arrivals: parts.arrivals,
+            membership: parts.membership,
+            waiting: parts.waiting,
+            pool_unsent: ready.pool_unsent,
+        }
+    }
+}
+
+impl MeshTransport {
+    /// The mesh thread's work channel, or the answer that the transport has
+    /// been closed (its thread ended, or `Drop` has taken the channel).
+    fn work(&self) -> Result<&UnboundedSender<Outbound>, String> {
+        self.out.as_ref().ok_or_else(|| "the mesh transport is closed".to_string())
+    }
+
     /// A silent device-tier join of `realm_name` through this transport's
     /// own pool: proves the key, asks the realm for a membership, stores
     /// the credential beside the identity keys. Blocking; call it from a
     /// worker thread (the UI does) or at startup.
     pub fn join_realm_device(&self, realm_name: &str) -> Result<RealmCredential, String> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.out
+        self.work()?
             .send(Outbound::DeviceJoin { realm_name: realm_name.to_string(), reply: tx })
             .map_err(|_| "the mesh transport is closed".to_string())?;
         rx.recv().map_err(|_| "the mesh transport ended before the join answered".to_string())?
@@ -448,7 +507,7 @@ impl MeshTransport {
     /// later start cannot renew it back.
     pub fn resign_memberships(&self) -> Result<ResignReport, String> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.out.send(Outbound::RealmResign { reply: tx }).map_err(|_| "the mesh transport is closed".to_string())?;
+        self.work()?.send(Outbound::RealmResign { reply: tx }).map_err(|_| "the mesh transport is closed".to_string())?;
         rx.recv().map_err(|_| "the mesh transport ended before the resignation answered".to_string())
     }
 }
@@ -531,7 +590,7 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
     // this function: a renewal that ran beside a resignation would mint the
     // membership back (macula-craft-collab#35).
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let renewals = keep_membership_renewals(&cfg, &pool, &identity, membership, shutdown_rx);
+    let mut renewals = keep_membership_renewals(&cfg, &pool, &identity, membership, shutdown_rx);
 
     // A host serves its share's key distributor before it pulls anything:
     // its own join below is a pull from itself, and a share whose key cannot
@@ -573,7 +632,7 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
                 let _ = reply.send(realm::renew_membership(&pool, &identity, &realm_name, now).await);
             }
             Outbound::RealmResign { reply } => {
-                let _ = reply.send(resign_every_membership(&pool, &identity).await);
+                let _ = reply.send(reign_ended(&pool, &identity, &shutdown_tx, &mut renewals).await);
             }
             Outbound::Publish(topic, json) => publish_sealed(&pool, realm, &group, topic, json, &waiting, &arrivals).await,
         }
@@ -603,15 +662,40 @@ fn keep_membership_renewals(
     Some(tokio::spawn(realm::keep_memberships_renewed(pool.clone(), identity.clone(), cfg.realm_id, membership, shutdown)))
 }
 
+/// A resignation asked for while the transport is running: the renewals stop
+/// first, and stay stopped (macula-craft-collab#35 r1).
+///
+/// A renewal that ticked during the wait could re-admit the row this call is
+/// proving ended, and one that listed the credential before it was forgotten
+/// would write it back after a reported pass — a false green. Stopped is
+/// stopped: everything that calls this is tearing the transport down.
+async fn reign_ended(
+    pool: &Pool,
+    identity: &Identity,
+    shutdown: &tokio::sync::watch::Sender<bool>,
+    renewals: &mut Option<tokio::task::JoinHandle<()>>,
+) -> ResignReport {
+    stop_renewals(shutdown, renewals).await;
+    resign_every_membership(pool, identity).await
+}
+
+/// Stops the renewal loop and waits for it to end, so nothing renews beside a
+/// resignation. Stopped is stopped: the loop is never restarted, because
+/// everything that calls this is ending the memberships it renewed.
+async fn stop_renewals(shutdown: &tokio::sync::watch::Sender<bool>, renewals: &mut Option<tokio::task::JoinHandle<()>>) {
+    let _ = shutdown.send(true);
+    if let Some(renewals) = renewals.take() {
+        let _ = renewals.await;
+    }
+}
+
 /// Ends the transport: the renewal loop stops first and is waited for, so no
 /// renewal can mint a membership back after it was resigned; then every
 /// membership this process holds is resigned, when it is a sweep that asked
 /// for that (`MACULA_CRAFT_RESIGN_ON_SHUTDOWN`, macula-craft-collab#35).
 async fn tear_down(pool: &Pool, identity: &Identity, shutdown: tokio::sync::watch::Sender<bool>, renewals: Option<tokio::task::JoinHandle<()>>) {
-    let _ = shutdown.send(true);
-    if let Some(renewals) = renewals {
-        let _ = renewals.await;
-    }
+    let mut renewals = renewals;
+    stop_renewals(&shutdown, &mut renewals).await;
     if realm::resign::resign_on_shutdown() {
         let report = resign_every_membership(pool, identity).await;
         log_resignation(&report);
@@ -889,7 +973,7 @@ impl Transport for MeshTransport {
                 return Err(e.to_string());
             }
         };
-        self.out.send(Outbound::Publish(topic, json)).map_err(|_| {
+        self.work()?.send(Outbound::Publish(topic, json)).map_err(|_| {
             self.arrivals.refused_outbound.fetch_add(1, Ordering::Relaxed);
             "the mesh link has ended".to_string()
         })
@@ -945,6 +1029,52 @@ pub(crate) fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    /// A stand-in for [`realm::keep_memberships_renewed`]: it ticks until it is
+    /// told to stop, then says it has ended.
+    async fn tick_until_stopped(ticks: Arc<AtomicU64>, ended: Arc<std::sync::atomic::AtomicBool>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        while !*shutdown.borrow() {
+            ticks.fetch_add(1, Ordering::Relaxed);
+            let stop = shutdown.changed();
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                changed = stop => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        ended.store(true, Ordering::Relaxed);
+    }
+
+    /// The renewal loop the resign path must wait for. The test's own stand-in
+    /// for [`realm::keep_memberships_renewed`]: it ticks until it is told to
+    /// stop, and says when it has ended.
+    #[test]
+    fn a_resignation_waits_for_the_renewal_loop_to_stop_first() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let ticks = Arc::new(AtomicU64::new(0));
+            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let loop_task = tokio::spawn(tick_until_stopped(ticks.clone(), ended.clone(), shutdown_rx));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(ticks.load(Ordering::Relaxed) > 0, "the loop was ticking before the resignation");
+
+            let mut renewals = Some(loop_task);
+            stop_renewals(&shutdown_tx, &mut renewals).await;
+
+            assert!(renewals.is_none(), "the handle is taken: the loop is not coming back");
+            assert!(
+                ended.load(Ordering::Relaxed),
+                "the loop had ENDED before the resignation path carried on — drop the await in stop_renewals and this is red"
+            );
+            let after_stop = ticks.load(Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            assert_eq!(ticks.load(Ordering::Relaxed), after_stop, "nothing renews after the stop returned");
+        });
+    }
+
     fn msg_json(author: &str) -> String {
         serde_json::to_string(&Message {
             doc: "demo".into(),
@@ -983,7 +1113,8 @@ mod tests {
         MeshTransport {
             author: "aabbcc".into(),
             prefix: "io.macula/~aabbcc/craft/9f9f".into(),
-            out,
+            out: Some(out),
+            thread: None,
             incoming,
             dropped_unverified: Arc::new(AtomicU64::new(0)),
             arrivals: Arrivals::default(),
