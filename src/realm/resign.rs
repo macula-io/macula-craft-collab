@@ -289,14 +289,27 @@ pub async fn read_membership(identity: &Identity, realm_name: &str, now_ms: u64)
     tokio::task::spawn_blocking(move || post_status(&realm_name, &identity, now_ms)).await.map_err(|e| format!("membership read: {e}"))?
 }
 
+/// The read's body: `{realm_id, member_did, public_key}`, which is exactly
+/// what the device signs; the proof is added to it afterwards (macula-realm#167).
+///
+/// The carried key travels with the request as the join body carries it: a node
+/// id cannot be turned back into a key, so the realm verifies the proof with
+/// this key and then holds `member_did` to the node id it derives from it.
+pub fn status_body(identity: &Identity, realm_name: &str) -> Json {
+    use base64::Engine as _;
+    let public_key = base64::engine::general_purpose::STANDARD.encode(identity.carried_key());
+    json!({"realm_id": realm_name, "member_did": identity.node_id(), "public_key": public_key})
+}
+
 /// One blocking POST of the proof-signed membership read. The signed body is
 /// `{realm_id, member_did}`, so the realm a read is about is inside the proof
 /// and cannot be swapped for another on the way.
 pub fn post_status(realm_name: &str, identity: &Identity, now_ms: u64) -> Result<MembershipStatus, String> {
-    let body = json!({"realm_id": realm_name, "member_did": identity.node_id()});
+    let body = status_body(identity, realm_name);
     let request = super::proof::canonical_json(&body)?;
     let proof = identity.device_request_proof(&realm_id_of(realm_name), READ_MEMBERSHIP_PROCEDURE, &request, now_ms)?;
-    let signed = json!({"realm_id": realm_name, "member_did": identity.node_id(), "proof": proof.to_json()});
+    let mut signed = body;
+    signed["proof"] = proof.to_json();
     let url = format!("{}{}", super::session::realm_base_url(realm_name), READ_MEMBERSHIP_PATH);
     let res = minreq::post(&url)
         .with_header("content-type", "application/json")
@@ -411,6 +424,18 @@ mod tests {
         for code in [401, 403, 404, 503] {
             assert!(parse_status(code, r#"{"status":"absent"}"#).is_err(), "HTTP {code} is an error even when the body says absent");
         }
+    }
+
+    #[test]
+    fn the_read_body_carries_the_realm_the_member_and_the_carried_key() {
+        use base64::Engine as _;
+        let identity = identity();
+        let body = status_body(&identity, "net.beam-campus");
+        assert_eq!(body["realm_id"], "net.beam-campus", "the realm is named: the realm resolves it, or refuses it");
+        assert_eq!(body["member_did"], identity.node_id(), "the member is named by its own node id");
+        let carried = base64::engine::general_purpose::STANDARD.encode(identity.carried_key());
+        assert_eq!(body["public_key"], carried, "the key travels as the join body carries it: a node id cannot be turned back into one");
+        assert!(body.get("proof").is_none(), "the proof is added after signing, never signed itself");
     }
 
     #[test]
