@@ -53,7 +53,7 @@ pub const RESIGN_RECORD_TYPE: u8 = 0x21;
 pub const READ_MEMBERSHIP_PROCEDURE: &str = "macula_realm.read_realm_membership";
 
 /// Where the realm serves that read: its member-facing host, the body
-/// `{realm_id, member_did, proof}` (macula-realm#167).
+/// `{realm_id, member_did, public_key, proof}` (macula-realm#167).
 pub const READ_MEMBERSHIP_PATH: &str = "/api/v1/memberships/status";
 
 /// How long a resignation waits for the realm to answer that the row ended.
@@ -302,8 +302,8 @@ pub fn status_body(identity: &Identity, realm_name: &str) -> Json {
 }
 
 /// One blocking POST of the proof-signed membership read. The signed body is
-/// `{realm_id, member_did}`, so the realm a read is about is inside the proof
-/// and cannot be swapped for another on the way.
+/// `{realm_id, member_did, public_key}`, so the realm a read is about is inside
+/// the proof and cannot be swapped for another on the way.
 pub fn post_status(realm_name: &str, identity: &Identity, now_ms: u64) -> Result<MembershipStatus, String> {
     let body = status_body(identity, realm_name);
     let request = super::proof::canonical_json(&body)?;
