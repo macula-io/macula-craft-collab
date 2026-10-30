@@ -43,6 +43,14 @@ A node on this crate reaches stations on wire 1.0 and no others.
   a realm's `/.well-known/macula-realm.json` under the name they mean and the
   fingerprint they checked. A host in one realm can share a document with
   another realm's members.
+- **Ending a membership**: `MeshTransport::resign_memberships()` publishes one
+  signed `0x21` record per realm this node holds a membership of — the realm's
+  name, this node's `member_did`, and the moment — then reads every one of them
+  back and reports `Ended` only when the realm says the row **ended**. A
+  record that merely landed is not an answer (macula-craft-collab#35,
+  macula-realm#167). `MACULA_CRAFT_RESIGN_ON_SHUTDOWN=1` makes a transport do
+  it when it stops, which is what a test sweep sets and a person's app never
+  does; `harness/run.sh` runs a sweep and tears it down on both paths.
 
 ## When the key cannot be had
 

@@ -27,6 +27,7 @@ pub use craft_mesh::{CraftMesh, DEFAULT_REALM};
 pub use grant::{KeyGrantVerifier, sign_grant, verified_access, verified_access_from, verify_grant};
 pub use identity::Identity;
 pub use issuer::{GROUP_CREDENTIAL_MS, IdentityIssuer, verify_invite};
+pub use realm::resign::{EndKind, MembershipStatus, ResignOutcome, ResignReport};
 pub use realm::trust::{RealmDescriptor, RealmTrust, TrustedRealm};
 pub use realm::{RealmCredential, RealmMemberVerifier, Tier};
 pub use roster::Roster;
@@ -274,6 +275,12 @@ enum Outbound {
         realm_name: String,
         reply: std::sync::mpsc::SyncSender<Result<RealmCredential, String>>,
     },
+    /// A resignation of every membership this node holds, run on the
+    /// transport's own pool: the teardown a sweep asks for explicitly
+    /// (macula-craft-collab#35).
+    RealmResign {
+        reply: std::sync::mpsc::SyncSender<ResignReport>,
+    },
 }
 
 impl MeshTransport {
@@ -429,6 +436,21 @@ impl MeshTransport {
             .map_err(|_| "the mesh transport is closed".to_string())?;
         rx.recv().map_err(|_| "the mesh transport ended before the join answered".to_string())?
     }
+
+    /// Ends every realm membership this node holds, and returns what the
+    /// realm answered for each: the teardown a sweep runs on both paths
+    /// (macula-craft-collab#35).
+    ///
+    /// Every held realm is resigned, not only the one this transport was
+    /// configured for — a membership left in a realm nobody pointed at is the
+    /// row macula-realm#136 is about. Blocking; call it from a worker thread.
+    /// A credential is forgotten once its membership is proven ended, so a
+    /// later start cannot renew it back.
+    pub fn resign_memberships(&self) -> Result<ResignReport, String> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.out.send(Outbound::RealmResign { reply: tx }).map_err(|_| "the mesh transport is closed".to_string())?;
+        rx.recv().map_err(|_| "the mesh transport ended before the resignation answered".to_string())
+    }
 }
 
 /// The knobs the mesh thread runs on, kept in one place so the runtime
@@ -504,13 +526,12 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
     // realm renewed before its 1 hour token runs out (macula-realm#46). Only
     // when a realm key is pinned: a call can only be resolved under it.
     // Non-fatal by design.
-    if cfg.realm_key.is_empty() {
-        if realm::auto_join_realm().is_some() {
-            eprintln!("realm auto-join: no realm key pinned in this config; skipping (calls need the trust anchor)");
-        }
-    } else {
-        tokio::spawn(realm::keep_memberships_renewed(pool.clone(), identity.clone(), cfg.realm_id, membership));
-    }
+    //
+    // The loop is stoppable, and the transport stops it first at the end of
+    // this function: a renewal that ran beside a resignation would mint the
+    // membership back (macula-craft-collab#35).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let renewals = keep_membership_renewals(&cfg, &pool, &identity, membership, shutdown_rx);
 
     // A host serves its share's key distributor before it pulls anything:
     // its own join below is a pull from itself, and a share whose key cannot
@@ -547,14 +568,82 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
     while let Some(out) = out_rx.recv().await {
         match out {
             Outbound::DeviceJoin { realm_name, reply } => {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+                let now = realm::now_ms();
                 // Through the renewal path, so a person's stored fields stay.
                 let _ = reply.send(realm::renew_membership(&pool, &identity, &realm_name, now).await);
+            }
+            Outbound::RealmResign { reply } => {
+                let _ = reply.send(resign_every_membership(&pool, &identity).await);
             }
             Outbound::Publish(topic, json) => publish_sealed(&pool, realm, &group, topic, json, &waiting, &arrivals).await,
         }
     }
+
+    // The transport is done: stop renewing, then end what it held.
+    tear_down(&pool, &identity, shutdown_tx, renewals).await;
     pool.close().await;
+}
+
+/// Starts the renewal loop, and only when a realm key is pinned: a transport
+/// that trusts no realm key resolves no calls, so it renews nothing and says
+/// so when an auto-join was asked for anyway.
+fn keep_membership_renewals(
+    cfg: &MeshConfig,
+    pool: &Pool,
+    identity: &Identity,
+    membership: Arc<Mutex<Option<String>>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if cfg.realm_key.is_empty() {
+        if realm::auto_join_realm().is_some() {
+            eprintln!("realm auto-join: no realm key pinned in this config; skipping (calls need the trust anchor)");
+        }
+        return None;
+    }
+    Some(tokio::spawn(realm::keep_memberships_renewed(pool.clone(), identity.clone(), cfg.realm_id, membership, shutdown)))
+}
+
+/// Ends the transport: the renewal loop stops first and is waited for, so no
+/// renewal can mint a membership back after it was resigned; then every
+/// membership this process holds is resigned, when it is a sweep that asked
+/// for that (`MACULA_CRAFT_RESIGN_ON_SHUTDOWN`, macula-craft-collab#35).
+async fn tear_down(pool: &Pool, identity: &Identity, shutdown: tokio::sync::watch::Sender<bool>, renewals: Option<tokio::task::JoinHandle<()>>) {
+    let _ = shutdown.send(true);
+    if let Some(renewals) = renewals {
+        let _ = renewals.await;
+    }
+    if realm::resign::resign_on_shutdown() {
+        let report = resign_every_membership(pool, identity).await;
+        log_resignation(&report);
+    }
+}
+
+/// Ends every membership this node holds and forgets the credentials of the
+/// ones proven ended: a credential that outlived its membership would be
+/// renewed back by the next start.
+async fn resign_every_membership(pool: &Pool, identity: &Identity) -> ResignReport {
+    let held = realm::list_credentials(identity.node_id());
+    let deadline = std::time::Duration::from_millis(realm::resign::END_DEADLINE_MS);
+    let report = realm::resign::resign_all(pool, identity, &held, deadline).await;
+    for outcome in &report.outcomes {
+        if let ResignOutcome::Ended { realm, .. } = outcome {
+            realm::forget_credential(identity.node_id(), realm);
+        }
+    }
+    report
+}
+
+/// A resignation that did not end every membership is said out loud: an
+/// operator reads it, and the sweep's own check is what turns it red.
+fn log_resignation(report: &ResignReport) {
+    for outcome in &report.outcomes {
+        match outcome {
+            ResignOutcome::Ended { realm, admitted_at_ms, .. } => {
+                eprintln!("realm resignation: {realm} ended the membership admitted at {admitted_at_ms}")
+            }
+            ResignOutcome::Unverified { realm, why } => eprintln!("realm resignation FAILED for {realm}: {why}"),
+        }
+    }
 }
 
 /// Publishes one message sealed under the share's group.

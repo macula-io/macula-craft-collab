@@ -7,6 +7,7 @@
 //! minted one, and (citizen) the refresh token and cert.
 
 pub mod proof;
+pub mod resign;
 pub mod session;
 pub mod trust;
 
@@ -22,6 +23,13 @@ pub use proof::{
 pub use session::{ConfirmedSession, CreatedSession, SessionStatus};
 
 use crate::identity::Identity;
+
+/// Milliseconds since the epoch, on this machine's clock. One definition for
+/// the realm module: a proof's timestamp, a record's `resigned_at` and a
+/// renewal's margin all read the same clock.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
 
 /// Which path bound this node to the realm: the silent device-tier proof, or
 /// a person through the realm's join session. A citizen credential is
@@ -139,6 +147,18 @@ pub fn store_credential_in(dir: &std::path::Path, cred: &RealmCredential) -> Res
     std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     secure_file(&path);
     Ok(path)
+}
+
+/// Deletes this node's stored credential for a realm, after its membership has
+/// been ended. A credential that outlived its membership is what a later
+/// start would renew, and renewing re-admits: the row would come back.
+pub fn forget_credential(node_id: &str, realm: &str) -> bool {
+    realm_dir().is_some_and(|dir| forget_credential_in(&dir, node_id, realm))
+}
+
+/// [`forget_credential`] against an explicit directory.
+pub fn forget_credential_in(dir: &std::path::Path, node_id: &str, realm: &str) -> bool {
+    std::fs::remove_file(credential_path(dir, node_id, realm)).is_ok()
 }
 
 /// Every confirmed membership this node holds, for `mesh_list_realms`-style
@@ -306,17 +326,42 @@ pub async fn renew_membership(pool: &Pool, identity: &Identity, realm_name: &str
 /// is set to its token, which the session presents to have its document
 /// grant extended. Only `realm_id` is renewed: the transport resolves calls
 /// under that realm's pinned key alone. Never fails; a failure is logged.
-pub async fn keep_memberships_renewed(pool: Pool, identity: Identity, realm_id: [u8; 32], current: std::sync::Arc<std::sync::Mutex<Option<String>>>) {
-    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-    ensure_auto_join(&pool, &identity, now()).await;
+///
+/// Stops when `shutdown` turns true, and not before a renewal it is inside
+/// has finished: a resign that ran while this loop was mid-renew would have
+/// the renewal mint the membership back. The caller waits for this future to
+/// end before it resigns anything.
+pub async fn keep_memberships_renewed(
+    pool: Pool,
+    identity: Identity,
+    realm_id: [u8; 32],
+    current: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    ensure_auto_join(&pool, &identity, now_ms()).await;
     loop {
-        for held in list_credentials(identity.node_id()).into_iter().filter(|c| realm_id_of(&c.realm) == realm_id) {
-            renew_one(&pool, &identity, &held, &current, now()).await;
+        if *shutdown.borrow() {
+            return;
         }
-        let mut jitter = [0u8; 2];
-        let jitter_ms = getrandom::getrandom(&mut jitter).map(|()| u64::from(u16::from_le_bytes(jitter)) % 60_000).unwrap_or(0);
-        tokio::time::sleep(std::time::Duration::from_millis(RENEW_CHECK_MS + jitter_ms)).await;
+        for held in list_credentials(identity.node_id()).into_iter().filter(|c| realm_id_of(&c.realm) == realm_id) {
+            renew_one(&pool, &identity, &held, &current, now_ms()).await;
+        }
+        let wait = std::time::Duration::from_millis(RENEW_CHECK_MS + jitter_ms());
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            stopped = shutdown.changed() => {
+                if stopped.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
     }
+}
+
+/// Up to a minute of jitter, so a fleet of members does not renew in step.
+fn jitter_ms() -> u64 {
+    let mut jitter = [0u8; 2];
+    getrandom::getrandom(&mut jitter).map(|()| u64::from(u16::from_le_bytes(jitter)) % 60_000).unwrap_or(0)
 }
 
 /// Renews one held membership when it is inside the renewal margin and
@@ -376,7 +421,19 @@ impl craft_collab::MembershipVerifier for RealmMemberVerifier {
 /// The realm's membership-minting procedure, realm-name-prefixed the way a
 /// procedure advertisement carries it.
 pub fn membership_ucan_procedure(realm_name: &str) -> String {
-    format!("{realm_name}/_realm/_realm/identity/issue_membership_ucan_v1")
+    realm_identity_procedure(realm_name, MEMBERSHIP_UCAN_PATH)
+}
+
+/// The identity-service path the membership UCAN is minted at (the proof
+/// names it `macula_realm.membership_ucan`; the two are different strings on
+/// purpose, as the realm's own verification has them).
+pub const MEMBERSHIP_UCAN_PATH: &str = "issue_membership_ucan_v1";
+
+/// A procedure of the realm's own identity service, realm-name-prefixed the
+/// way a procedure advertisement carries it: the realm service answers under
+/// `<realm>/_realm/_realm/identity/<procedure>`.
+pub fn realm_identity_procedure(realm_name: &str, procedure: &str) -> String {
+    format!("{realm_name}/_realm/_realm/identity/{procedure}")
 }
 
 /// A text field of a reply, unwrapping macula-realm's double-hex encoding of

@@ -5,6 +5,45 @@ All notable changes to this crate are documented here. Format follows
 so a minor version may carry a small breaking change where one was the right
 call.
 
+## [Unreleased]
+
+### Added
+
+- **A transport can end the realm memberships it created, and prove it**
+  (macula-craft-collab#35). `MeshTransport::resign_memberships()` publishes one
+  signed `0x21` record per realm this node holds a membership of — the realm's
+  **name** (the only identifier a client can know, resolved by the realm:
+  macula-realm#169), this node's `member_did`, and the moment — and then reads
+  each membership back, reporting `Ended` only when the realm answers that the
+  row ended, with the same admission moment the call pinned before publishing.
+  `Absent`, an error, another membership's row, or no answer inside 90 seconds
+  is `Unverified`, which a sweep treats as failure: the record's echo proves a
+  station took it, never that the aggregate acted.
+- **`MACULA_CRAFT_RESIGN_ON_SHUTDOWN=1`** resigns every held membership when a
+  transport stops, after stopping the renewal loop and waiting for it, so no
+  renewal can mint a membership back. Off by default: a person closing an app
+  must not leave their realm, and only a test sweep sets it. Ended
+  memberships' stored credentials are forgotten, so a later start cannot renew
+  one back into admitted.
+- **`harness/run.sh`** runs one sweep against one realm — the realm named once
+  and exported as the realm the app joins and auto-joins, `io.macula` refused
+  outright (macula-craft-collab#41) — and tears the run down on both paths
+  through each instance's control port (`collab.realmResign`). A teardown that
+  did not end every membership fails the sweep even when the driver passed.
+
+### Changed
+
+- `keep_memberships_renewed` takes a shutdown signal and stops on it, and
+  `realm::now_ms`, `realm::realm_identity_procedure` and
+  `realm::forget_credential` are now part of the module's surface.
+
+### Known
+
+- The read-back the resignation is proven by needs the realm's membership
+  read (macula-realm#167) and the listener's realm resolution
+  (macula-realm#169). Until both land, a sweep is red by design: the record
+  publishes and nothing ends, which is exactly what the check reports.
+
 ## [0.9.0] - 2026-10-30
 
 Builds on macula-craft-seam 0.7.0 (released the same day).
