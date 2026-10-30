@@ -299,6 +299,23 @@ pub async fn renew_membership(pool: &Pool, identity: &Identity, realm_name: &str
     Ok(cred)
 }
 
+/// The silent auto-join, when it is this transport's to do.
+///
+/// A transport renews and resolves calls under the realm it is pinned to, so a
+/// join into any other realm is a second membership this node creates where
+/// nobody pointed it — which is how a sweep came to leave member rows in the
+/// production realm while it was aimed at a test realm
+/// (macula-craft-collab#41). The realm the transport runs in is the only one
+/// it may silently join; anything else is refused and logged, never joined.
+///
+/// Returns the refusal, for an operator to read and a test to assert on.
+pub fn check_auto_join(auto_join: &str, session_realm_id: [u8; 32]) -> Result<(), String> {
+    if realm_id_of(auto_join) == session_realm_id {
+        return Ok(());
+    }
+    Err(format!("realm auto-join into {auto_join} refused: this transport runs in another realm (macula-craft-collab#41)"))
+}
+
 /// Keeps this node's membership of `realm_id` renewed while the transport
 /// runs: the silent auto-join first (when opted in), then every
 /// [`RENEW_CHECK_MS`] (plus up to a minute of jitter) every stored
@@ -308,7 +325,7 @@ pub async fn renew_membership(pool: &Pool, identity: &Identity, realm_name: &str
 /// under that realm's pinned key alone. Never fails; a failure is logged.
 pub async fn keep_memberships_renewed(pool: Pool, identity: Identity, realm_id: [u8; 32], current: std::sync::Arc<std::sync::Mutex<Option<String>>>) {
     let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-    ensure_auto_join(&pool, &identity, now()).await;
+    ensure_auto_join(&pool, &identity, realm_id, now()).await;
     loop {
         for held in list_credentials(identity.node_id()).into_iter().filter(|c| realm_id_of(&c.realm) == realm_id) {
             renew_one(&pool, &identity, &held, &current, now()).await;
@@ -448,13 +465,18 @@ pub async fn join_device(pool: &Pool, identity: &Identity, realm_name: &str, now
 }
 
 /// The idempotent, non-fatal entry point, called on connect: no-op when the
-/// feature is off or this node already holds a credential for the realm
-/// with time to run; otherwise it joins or renews, keeping a person's
+/// feature is off, when it names a realm this transport does not run in
+/// ([`check_auto_join`]), or when this node already holds a credential for the
+/// realm with time to run; otherwise it joins or renews, keeping a person's
 /// fields. A failure is logged and never takes the connection down.
-pub async fn ensure_auto_join(pool: &Pool, identity: &Identity, now_ms: u64) {
+pub async fn ensure_auto_join(pool: &Pool, identity: &Identity, session_realm_id: [u8; 32], now_ms: u64) {
     let Some(realm_name) = auto_join_realm() else {
         return;
     };
+    if let Err(refusal) = check_auto_join(&realm_name, session_realm_id) {
+        log_stderr(&refusal);
+        return;
+    }
     if let Some(cred) = load_credential(identity.node_id(), &realm_name)
         && !needs_renewal(&cred, now_ms)
     {
@@ -476,6 +498,15 @@ mod tests {
     #[test]
     fn the_realm_id_is_the_sha256_of_the_name() {
         assert_eq!(hex::encode(realm_id_of("io.macula")), "abb81b5a614b63551b400b810648c0c8a78efad845442630c94b46cc95d2fcd1");
+    }
+
+    #[test]
+    fn a_transport_joins_only_the_realm_it_runs_in() {
+        let test_realm = realm_id_of("net.beam-campus");
+        assert!(check_auto_join("net.beam-campus", test_realm).is_ok(), "its own realm is this transport's to join");
+        let refusal = check_auto_join("io.macula", test_realm).expect_err("the production realm is not");
+        assert!(refusal.contains("io.macula"), "the refusal names the realm it refused: {refusal}");
+        assert!(check_auto_join("io.macula", realm_id_of("io.macula")).is_ok(), "a transport in io.macula may still join it");
     }
 
     #[test]
