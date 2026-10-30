@@ -9,6 +9,11 @@ call.
 
 Builds on macula-craft-seam 0.7.0 (released the same day).
 
+**Not in this release:** the `Gap{t1,t2}` state-vector resync. It waits for the
+joint SDK release's Gap notice (macula-station#129, phase 1) and ships in 0.10.
+Nothing an app does today depends on it, so 0.9.0 is tagged without it rather
+than held for it.
+
 ### Added
 
 - **A person is told when an edit of theirs did not leave** (macula-craft-collab#39).
