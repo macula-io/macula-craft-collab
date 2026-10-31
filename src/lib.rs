@@ -32,6 +32,7 @@ pub use realm::trust::{RealmDescriptor, RealmTrust, TrustedRealm};
 pub use realm::{RealmCredential, RealmMemberVerifier, Tier};
 pub use roster::Roster;
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -41,7 +42,7 @@ use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
 use macula_rust::group::{Distributor, DistributorOptions, Group, MembershipCheck, Policy, Reason, RemovedCheck, org_of};
 use macula_rust::node_key::{NodeKey, key_id_of};
-use macula_rust::pool::{Opts, Pool, Seed, Subscription};
+use macula_rust::pool::{Delivery, Gap, Interruption, Opts, Pool, Seed, Subscription};
 use macula_rust::station_link::Event;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -158,6 +159,9 @@ pub struct MeshTransport {
     /// have read it, and no link took it again in time (macula-craft-collab#38).
     /// Asked of the pool rather than copied, so the number is the pool's own.
     pool_unsent: PoolUnsent,
+    /// What the SDK's delivery notices mean for this share, discussed in
+    /// [`CutOff`]: one interruption and one gap per outage, not one per topic.
+    cut_off: CutOff,
 }
 
 /// How a transport asks its pool what it accepted and could not deliver. A
@@ -200,6 +204,81 @@ struct Arrivals {
     /// that says an edit did not leave: an application shows it and the two
     /// copies are known to differ rather than silently going their own way.
     refused_outbound: Arc<AtomicU64>,
+}
+
+/// What the SDK's delivery notices mean for a SHARE (macula-craft-collab#45).
+///
+/// A share holds one subscription per topic ([`NAMES`]) and they all ride the
+/// same links, so one outage raises a [`Delivery::Interrupted`] on every topic
+/// in the same instant. Handed up raw that is seven losses and a flapping
+/// connection; what an app needs to say is "this share was cut off from T1 to
+/// T2". So the topics are folded here by name: the share is interrupted while
+/// ANY topic is, from the earliest moment any of them last heard from its
+/// station, and it is back when the LAST of them has a gap — one interruption
+/// and one gap for one outage, however many topics noticed it.
+///
+/// Nothing about what a link end or a retransmit means is re-derived here: the
+/// SDK decides that (macula-station#129) and this only answers "the share, not
+/// the subscription". The transport holds no document, so it reports the
+/// window that may be missing and resyncs nothing.
+#[derive(Clone, Default)]
+struct CutOff {
+    inner: Arc<Mutex<CutOffState>>,
+}
+
+#[derive(Default)]
+struct CutOffState {
+    /// The topics interrupted and not yet given a gap.
+    topics: HashSet<&'static str>,
+    /// When the earliest of them last heard from its station.
+    from_ms: u64,
+    /// Why the earliest of them ended.
+    reason: String,
+    /// How many outages this share has been through, and the last one.
+    gaps: u64,
+    last_gap: Option<Gap>,
+}
+
+impl CutOff {
+    /// `topic` lost its last covering link: the share is interrupted from
+    /// `notice.from_ms`, which is the earliest of the topics cut off with it.
+    fn interrupted(&self, topic: &'static str, notice: Interruption) {
+        let Ok(mut state) = self.inner.lock() else { return };
+        if !state.topics.insert(topic) {
+            return;
+        }
+        if state.topics.len() == 1 || notice.from_ms < state.from_ms {
+            state.from_ms = notice.from_ms;
+            state.reason = notice.reason;
+        }
+    }
+
+    /// `topic` is carried again. The share is back only when no other topic is
+    /// still interrupted; the gap it reports covers the whole outage.
+    fn gapped(&self, topic: &'static str, notice: Gap) {
+        let Ok(mut state) = self.inner.lock() else { return };
+        if !state.topics.remove(topic) || !state.topics.is_empty() {
+            return;
+        }
+        state.gaps += 1;
+        state.last_gap = Some(Gap { from_ms: state.from_ms, to_ms: notice.to_ms, reason: state.reason.clone() });
+        state.from_ms = 0;
+        state.reason.clear();
+    }
+
+    /// Why the share is cut off now, and since when; `None` when it is not.
+    fn now(&self) -> Option<Interruption> {
+        let state = self.inner.lock().ok()?;
+        (!state.topics.is_empty()).then(|| Interruption { from_ms: state.from_ms, reason: state.reason.clone() })
+    }
+
+    fn last_gap(&self) -> Option<Gap> {
+        self.inner.lock().ok().and_then(|state| state.last_gap.clone())
+    }
+
+    fn gaps(&self) -> u64 {
+        self.inner.lock().map(|state| state.gaps).unwrap_or(0)
+    }
 }
 
 impl MeshTransport {
@@ -271,6 +350,36 @@ impl MeshTransport {
     pub fn waiting(&self) -> Option<Reason> {
         self.waiting.lock().ok().and_then(|waiting| *waiting)
     }
+
+    /// Why this share is cut off from the mesh now, and since when: the last
+    /// link carrying any of its topics ended, so events published from
+    /// `from_ms` on may be missed (`macula-craft-collab#45`).
+    ///
+    /// This is the SHARE's answer, not one subscription's: the seven topics
+    /// ride the same links, so an outage interrupts all of them at once and a
+    /// raw per-subscription notice would read as seven losses. `None` means
+    /// at least one link carries every topic.
+    pub fn interrupted(&self) -> Option<Interruption> {
+        self.cut_off.now()
+    }
+
+    /// The window a share that came back may have missed: the earliest moment
+    /// an interrupted topic last heard from its station, and the moment a
+    /// station accepted one again. `None` before the first outage a share has
+    /// been through, and after that the LAST one, so an app polling slowly
+    /// still learns what happened rather than only that something did.
+    ///
+    /// The times are hints, exactly as the SDK states them: an event's
+    /// `published_at` is its publisher's clock. Answer a gap by resyncing the
+    /// document, never by discarding events whose time falls outside it.
+    pub fn last_gap(&self) -> Option<Gap> {
+        self.cut_off.last_gap()
+    }
+
+    /// How many outages this share has been cut off by and come back from.
+    pub fn gaps(&self) -> u64 {
+        self.cut_off.gaps()
+    }
 }
 
 /// What the background thread publishes.
@@ -318,47 +427,69 @@ impl MeshTransport {
                 "{prefix}: a sealed share's distributor must be pinned to a node id (the invite names it); an unpinned share is refused rather than joined on the first answer"
             ));
         }
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (in_tx, in_rx) = std::sync::mpsc::channel::<Message>();
-        let cfg = cfg.clone();
         let author = identity.node_id().to_string();
-        let key = identity.key();
         let group = Group { prefix: prefix.clone(), ucan: cfg.share.grant.clone(), distributor: cfg.share.distributor };
-        let identity = identity.clone();
-        let dropped = Arc::new(AtomicU64::new(0));
-        let dropped_in_thread = dropped.clone();
-        let arrivals = Arrivals::default();
-        let arrivals_in_thread = arrivals.clone();
-        let membership = Arc::new(Mutex::new(None));
-        let membership_in_thread = membership.clone();
-        let waiting = Arc::new(Mutex::new(None));
-        let waiting_in_thread = waiting.clone();
-        let thread = std::thread::Builder::new()
-            .name("macula-craft-collab".into())
-            .spawn(move || {
-                run_on_new_runtime(
-                    cfg,
-                    host,
-                    key,
-                    identity,
-                    group,
-                    in_tx,
-                    ready_tx,
-                    dropped_in_thread,
-                    arrivals_in_thread,
-                    membership_in_thread,
-                    waiting_in_thread,
-                );
-            })
-            .map_err(|e| format!("thread: {e}"))?;
-        let parts =
-            TransportParts { author, prefix, thread: Some(thread), incoming: in_rx, dropped_unverified: dropped, arrivals, membership, waiting };
+        let (side, ready_rx) = spawn_mesh_thread(cfg.clone(), host, group, identity)?;
+        let parts = TransportParts {
+            author,
+            prefix,
+            thread: Some(side.thread),
+            incoming: side.in_rx,
+            dropped_unverified: side.dropped,
+            arrivals: side.arrivals,
+            membership: side.membership,
+            waiting: side.waiting,
+            cut_off: side.cut_off,
+        };
         match ready_rx.recv() {
             Ok(Ok(ready)) => Ok(MeshTransport::from_ready(ready, parts)),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("the mesh thread ended before it was ready: {e}")),
         }
     }
+}
+
+/// The shared handles a transport and its mesh thread both hold, made once
+/// before the thread starts: the thread keeps the write side of each and the
+/// transport the read side.
+struct MeshSide {
+    thread: std::thread::JoinHandle<()>,
+    in_rx: Receiver<Message>,
+    dropped: Arc<AtomicU64>,
+    arrivals: Arrivals,
+    membership: Arc<Mutex<Option<String>>>,
+    waiting: Arc<Mutex<Option<Reason>>>,
+    cut_off: CutOff,
+}
+
+/// Starts the mesh thread and hands back both sides of it. Split out of
+/// [`MeshTransport::connect`] so that function stays a readable length rather
+/// than the structural lint's limit.
+fn spawn_mesh_thread(
+    cfg: MeshConfig,
+    host: bool,
+    group: Group,
+    identity: &Identity,
+) -> Result<(MeshSide, std::sync::mpsc::Receiver<Result<Ready, String>>), String> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (in_tx, in_rx) = std::sync::mpsc::channel::<Message>();
+    let key = identity.key();
+    let identity = identity.clone();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let arrivals = Arrivals::default();
+    let membership = Arc::new(Mutex::new(None));
+    let waiting = Arc::new(Mutex::new(None));
+    let cut_off = CutOff::default();
+    let in_thread = (dropped.clone(), arrivals.clone(), membership.clone(), waiting.clone(), cut_off.clone());
+    let thread = std::thread::Builder::new()
+        .name("macula-craft-collab".into())
+        .spawn(move || {
+            let (dropped, arrivals, membership, waiting, cut_off) = in_thread;
+            run_on_new_runtime(cfg, host, key, identity, group, in_tx, ready_tx, dropped, arrivals, membership, waiting, cut_off);
+        })
+        .map_err(|e| format!("thread: {e}"))?;
+
+    Ok((MeshSide { thread, in_rx, dropped, arrivals, membership, waiting, cut_off }, ready_rx))
 }
 
 impl Drop for MeshTransport {
@@ -456,6 +587,7 @@ struct TransportParts {
     arrivals: Arrivals,
     membership: Arc<Mutex<Option<String>>>,
     waiting: Arc<Mutex<Option<Reason>>>,
+    cut_off: CutOff,
 }
 
 impl MeshTransport {
@@ -473,6 +605,7 @@ impl MeshTransport {
             membership: parts.membership,
             waiting: parts.waiting,
             pool_unsent: ready.pool_unsent,
+            cut_off: parts.cut_off,
         }
     }
 }
@@ -527,6 +660,7 @@ struct MeshThread {
     arrivals: Arrivals,
     membership: Arc<Mutex<Option<String>>>,
     waiting: Arc<Mutex<Option<Reason>>>,
+    cut_off: CutOff,
 }
 
 /// Builds the mesh thread's runtime and runs the transport loop on it. A
@@ -544,6 +678,7 @@ fn run_on_new_runtime(
     arrivals: Arrivals,
     membership: Arc<Mutex<Option<String>>>,
     waiting: Arc<Mutex<Option<Reason>>>,
+    cut_off: CutOff,
 ) {
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -552,14 +687,14 @@ fn run_on_new_runtime(
             return;
         }
     };
-    let thread = MeshThread { cfg, host, key, identity, group, ready, dropped, arrivals, membership, waiting };
+    let thread = MeshThread { cfg, host, key, identity, group, ready, dropped, arrivals, membership, waiting, cut_off };
     rt.block_on(run(thread, in_tx));
 }
 
 /// Runs until the transport is dropped: then the outbound channel closes,
 /// the loop ends and the pool closes.
 async fn run(thread: MeshThread, in_tx: Sender<Message>) {
-    let MeshThread { cfg, host, key, identity, group, ready, dropped, arrivals, membership, waiting } = thread;
+    let MeshThread { cfg, host, key, identity, group, ready, dropped, arrivals, membership, waiting, cut_off } = thread;
     let mut opts = Opts::new(key.clone());
     // Pubsub needs no realm trust: it is only consulted when a call resolves
     // an advertisement. An empty key means "trust nothing in this realm".
@@ -609,7 +744,7 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
     // knocks. A group whose key cannot be had fails closed — and while the
     // share's distributor is simply not answering yet, the transport waits
     // for it instead of taking the session down (threat model T11).
-    let started = start_share(&pool, &cfg, &group, &in_tx, &dropped, &arrivals, &waiting).await;
+    let started = start_share(&pool, &cfg, &group, &in_tx, &dropped, &arrivals, &waiting, &cut_off).await;
     if let Err(e) = started {
         let _ = ready.send(Err(e));
         return;
@@ -805,11 +940,12 @@ async fn start_share(
     dropped: &Arc<AtomicU64>,
     arrivals: &Arrivals,
     waiting: &Arc<Mutex<Option<Reason>>>,
+    cut_off: &CutOff,
 ) -> Result<(), String> {
     match subscribe_all(pool, cfg, group).await {
         Ok(subs) => {
             *waiting.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            pump_all(subs, in_tx, dropped, arrivals, waiting);
+            pump_all(subs, in_tx, dropped, arrivals, waiting, cut_off);
             Ok(())
         }
         // Two reasons are the share waiting for an answer rather than a
@@ -827,6 +963,7 @@ async fn start_share(
                 dropped.clone(),
                 arrivals.clone(),
                 waiting.clone(),
+                cut_off.clone(),
             ));
             Ok(())
         }
@@ -846,10 +983,19 @@ async fn subscribe_all(pool: &Pool, cfg: &MeshConfig, group: &Group) -> Result<V
     Ok(subs)
 }
 
-/// Hands each subscription to the transport, on a task of its own.
-fn pump_all(subs: Vec<Subscription>, in_tx: &Sender<Message>, dropped: &Arc<AtomicU64>, arrivals: &Arrivals, waiting: &Arc<Mutex<Option<Reason>>>) {
-    for sub in subs {
-        tokio::spawn(pump_events(sub, in_tx.clone(), dropped.clone(), arrivals.clone(), waiting.clone()));
+/// Hands each subscription to the transport, on a task of its own, each with
+/// the topic it carries: what a delivery notice is about (the share, not this
+/// subscription) is decided in [`CutOff`], which needs to know who noticed.
+fn pump_all(
+    subs: Vec<Subscription>,
+    in_tx: &Sender<Message>,
+    dropped: &Arc<AtomicU64>,
+    arrivals: &Arrivals,
+    waiting: &Arc<Mutex<Option<Reason>>>,
+    cut_off: &CutOff,
+) {
+    for (sub, topic) in subs.into_iter().zip(NAMES) {
+        tokio::spawn(pump_events(sub, topic, in_tx.clone(), dropped.clone(), arrivals.clone(), waiting.clone(), cut_off.clone()));
     }
 }
 
@@ -866,13 +1012,14 @@ async fn wait_for_distributor(
     dropped: Arc<AtomicU64>,
     arrivals: Arrivals,
     waiting: Arc<Mutex<Option<Reason>>>,
+    cut_off: CutOff,
 ) {
     loop {
         tokio::time::sleep(DISTRIBUTOR_RETRY).await;
         match subscribe_all(&pool, &cfg, &group).await {
             Ok(subs) => {
                 note_sharing(&waiting, None);
-                pump_all(subs, &in_tx, &dropped, &arrivals, &waiting);
+                pump_all(subs, &in_tx, &dropped, &arrivals, &waiting, &cut_off);
                 return;
             }
             // Two reasons go on waiting: no distributor yet, and one that
@@ -889,12 +1036,53 @@ async fn wait_for_distributor(
     }
 }
 
-/// Feeds a subscription's events to the transport until the transport drops
-/// its receiving end or the subscription ends.
-async fn pump_events(mut sub: Subscription, tx: Sender<Message>, dropped: Arc<AtomicU64>, arrivals: Arrivals, waiting: Arc<Mutex<Option<Reason>>>) {
-    while let Some(event) = sub.recv().await {
-        if !deliver_event(&event, &tx, &dropped, &arrivals, &waiting) {
+/// Feeds a subscription's deliveries to the transport until the transport
+/// drops its receiving end or the subscription ends.
+///
+/// `recv` yields a [`Delivery`], not an `Event` (macula-rust 0.15.0,
+/// macula-station#129 phase 1): an event is handed on exactly as before, and
+/// the two notices — this subscription's last covering link ended, and a
+/// station carries it again — go to the share's [`CutOff`], which folds them
+/// so an app sees one outage rather than seven (macula-craft-collab#45).
+#[allow(clippy::too_many_arguments)]
+async fn pump_events(
+    mut sub: Subscription,
+    topic: &'static str,
+    tx: Sender<Message>,
+    dropped: Arc<AtomicU64>,
+    arrivals: Arrivals,
+    waiting: Arc<Mutex<Option<Reason>>>,
+    cut_off: CutOff,
+) {
+    while let Some(delivery) = sub.recv().await {
+        if !absorb(delivery, topic, &tx, &dropped, &arrivals, &waiting, &cut_off) {
             break;
+        }
+    }
+}
+
+/// One delivery off a subscription's stream: the event handed on exactly as
+/// before, or the notice folded into the share's cut-off state. False when the
+/// transport's receiving end has closed, which ends the pump.
+#[allow(clippy::too_many_arguments)]
+fn absorb(
+    delivery: Delivery,
+    topic: &'static str,
+    tx: &Sender<Message>,
+    dropped: &Arc<AtomicU64>,
+    arrivals: &Arrivals,
+    waiting: &Arc<Mutex<Option<Reason>>>,
+    cut_off: &CutOff,
+) -> bool {
+    match delivery {
+        Delivery::Event(event) => deliver_event(&event, tx, dropped, arrivals, waiting),
+        Delivery::Interrupted(notice) => {
+            cut_off.interrupted(topic, notice);
+            true
+        }
+        Delivery::Gap(notice) => {
+            cut_off.gapped(topic, notice);
+            true
         }
     }
 }
@@ -1121,6 +1309,7 @@ mod tests {
             membership: Arc::new(Mutex::new(None)),
             waiting: Arc::new(Mutex::new(None)),
             pool_unsent,
+            cut_off: CutOff::default(),
         }
     }
 
@@ -1260,5 +1449,125 @@ mod tests {
         assert_eq!(arrivals.unusable.load(Ordering::Relaxed), 1, "and it is counted");
         assert_eq!(dropped.load(Ordering::Relaxed), 0, "not a forged author");
         assert_eq!(arrivals.clear_refused.load(Ordering::Relaxed), 0, "not a clear event either");
+    }
+
+    // macula-craft-collab#45: the seven topics ride the same links, so one
+    // outage raises a notice on all of them at once. What an app is told must
+    // be the OUTAGE, not the fan-out.
+    fn interrupted_at(from_ms: u64) -> Interruption {
+        Interruption { from_ms, reason: "idle_timeout".to_string() }
+    }
+
+    fn gapped_at(from_ms: u64, to_ms: u64) -> Gap {
+        Gap { from_ms, to_ms, reason: "idle_timeout".to_string() }
+    }
+
+    #[test]
+    fn one_outage_is_one_interruption_and_one_gap_however_many_topics_noticed_it() {
+        let cut_off = CutOff::default();
+
+        for topic in NAMES {
+            cut_off.interrupted(topic, interrupted_at(1_000));
+        }
+
+        // One share, one interruption — not seven.
+        assert_eq!(cut_off.now(), Some(interrupted_at(1_000)));
+        assert_eq!(cut_off.gaps(), 0, "nothing has come back yet");
+
+        // The topics come back one at a time, as links do.
+        for topic in NAMES.iter().take(NAMES.len() - 1) {
+            cut_off.gapped(topic, gapped_at(1_000, 9_000));
+            assert!(cut_off.now().is_some(), "one topic still cut off is the share still cut off");
+        }
+
+        assert_eq!(cut_off.gaps(), 0, "the share is not back until every topic is");
+        assert!(cut_off.last_gap().is_none());
+
+        cut_off.gapped(NAMES[NAMES.len() - 1], gapped_at(1_000, 9_000));
+
+        assert_eq!(cut_off.now(), None, "every topic is carried again");
+        assert_eq!(cut_off.gaps(), 1, "one outage, one gap");
+        assert_eq!(cut_off.last_gap(), Some(gapped_at(1_000, 9_000)));
+    }
+
+    #[test]
+    fn a_share_interrupted_by_two_outages_reports_the_earliest_moment_and_keeps_the_last_gap() {
+        let cut_off = CutOff::default();
+
+        // Two topics, two different links going: the share was cut off from
+        // the earliest of them, which is what a resync must cover.
+        cut_off.interrupted(NAME_TEXT, Interruption { from_ms: 5_000, reason: "closed".to_string() });
+        cut_off.interrupted(NAME_JOIN, Interruption { from_ms: 2_000, reason: "idle_timeout".to_string() });
+
+        assert_eq!(
+            cut_off.now(),
+            Some(Interruption { from_ms: 2_000, reason: "idle_timeout".to_string() }),
+            "the earliest moment any interrupted topic last heard from its station"
+        );
+
+        cut_off.gapped(NAME_TEXT, gapped_at(5_000, 7_000));
+        cut_off.gapped(NAME_JOIN, gapped_at(2_000, 8_000));
+
+        assert_eq!(cut_off.last_gap(), Some(gapped_at(2_000, 8_000)), "the window covers the whole outage");
+        assert_eq!(cut_off.gaps(), 1);
+
+        // A second outage is a second gap, and the last one wins: an app that
+        // polls slowly still learns the window that most recently closed.
+        cut_off.interrupted(NAME_TEXT, interrupted_at(20_000));
+        cut_off.gapped(NAME_TEXT, gapped_at(20_000, 21_000));
+
+        assert_eq!(cut_off.gaps(), 2);
+        assert_eq!(cut_off.last_gap(), Some(gapped_at(20_000, 21_000)));
+    }
+
+    // A gap for a topic that was never interrupted is not an outage this share
+    // recovered from: it must not invent one, nor count one.
+    #[test]
+    fn a_gap_for_a_topic_that_was_never_interrupted_changes_nothing() {
+        let cut_off = CutOff::default();
+
+        cut_off.gapped(NAME_GRANT, gapped_at(1_000, 2_000));
+
+        assert_eq!(cut_off.now(), None);
+        assert_eq!(cut_off.gaps(), 0);
+        assert!(cut_off.last_gap().is_none());
+    }
+
+    // A notice is about the share, not a document message: the pump's own
+    // routing sends it to the cut-off state and hands the seam nothing.
+    #[test]
+    fn a_notice_is_routed_to_the_share_and_never_to_the_seam() {
+        let cut_off = CutOff::default();
+        let (tx, rx) = arriving();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let arrivals = Arrivals::default();
+        let waiting = Arc::new(Mutex::new(None));
+
+        let carried = |delivery| absorb(delivery, NAME_TEXT, &tx, &dropped, &arrivals, &waiting, &cut_off);
+
+        assert!(carried(Delivery::Interrupted(interrupted_at(1_000))));
+        assert_eq!(cut_off.now(), Some(interrupted_at(1_000)));
+        assert!(rx.try_recv().is_err(), "a notice is not a document message");
+
+        assert!(carried(Delivery::Gap(gapped_at(1_000, 2_000))));
+        assert_eq!(cut_off.now(), None);
+        assert_eq!(cut_off.gaps(), 1);
+        assert!(rx.try_recv().is_err(), "nor is the gap that closes it");
+    }
+
+    // A notice that arrives twice for the same topic (a re-subscribe that is
+    // interrupted again, or a link ending twice) is still one interruption.
+    #[test]
+    fn the_same_topic_reported_twice_is_still_one_interruption() {
+        let cut_off = CutOff::default();
+
+        cut_off.interrupted(NAME_TEXT, interrupted_at(1_000));
+        cut_off.interrupted(NAME_TEXT, interrupted_at(3_000));
+
+        assert_eq!(cut_off.now(), Some(interrupted_at(1_000)), "the first moment it was cut off stands");
+
+        cut_off.gapped(NAME_TEXT, gapped_at(1_000, 4_000));
+
+        assert_eq!(cut_off.gaps(), 1);
     }
 }

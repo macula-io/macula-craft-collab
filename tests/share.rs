@@ -22,7 +22,7 @@ use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
 use macula_rust::group::Reason;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
-use macula_rust::pool::{Opts, Pool, Seed};
+use macula_rust::pool::{Delivery, Opts, Pool, Seed};
 use macula_rust::profile::Profile;
 
 const PROFILE: Profile = Profile::PqHybrid;
@@ -248,12 +248,24 @@ async fn a_share_works_end_to_end_and_a_realm_member_reads_ciphertext_only() {
     // T1: the realm member watching the share's topic read ciphertext and
     // nothing else, and could open none of it.
     let mut heard = 0;
-    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(500), watching.recv()).await {
-        assert_eq!(event.unopened, Some(Reason::NoGroup), "a node without the group is handed the event unopened");
-        assert!(matches!(event.payload, Payload::Clear(Value::Null)), "and with no payload: a ciphertext is never mistaken for one");
-        heard += 1;
+    while let Ok(Some(delivery)) = tokio::time::timeout(Duration::from_millis(500), watching.recv()).await {
+        heard += watcher_read(delivery);
     }
     assert!(heard > 0, "the member was subscribed to a topic the share used, and heard {heard} events");
+}
+
+/// One delivery the watcher read, as the T1 test counts them: an event it could
+/// not open, and nothing else. A link notice is not an event and counts
+/// nothing, so the test asserts on what the watcher actually READ.
+fn watcher_read(delivery: Delivery) -> usize {
+    match delivery {
+        Delivery::Event(event) => {
+            assert_eq!(event.unopened, Some(Reason::NoGroup), "a node without the group is handed the event unopened");
+            assert!(matches!(event.payload, Payload::Clear(Value::Null)), "and with no payload: a ciphertext is never mistaken for one");
+            1
+        }
+        Delivery::Interrupted(_) | Delivery::Gap(_) => 0,
+    }
 }
 
 /// A host and an invited joiner, connected: the joiner holds the share's key

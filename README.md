@@ -63,6 +63,27 @@ state instead of pretending the document is shared. Any other refusal — the
 distributor saying `not_a_member`, say — fails the connect outright, because
 waiting would never end.
 
+## When a share may have missed edits
+
+The mesh's links come and go, and a share has to say so rather than let a
+document sit quietly stale. `interrupted()` answers why the share is cut off
+and since when (`None` while any link carries it); when a station carries it
+again, `last_gap()` gives the window that may be missing — the earliest moment
+an interrupted topic last heard from its station, and the moment a station
+accepted one again — and `gaps()` counts the outages the share has come back
+from.
+
+It is the SHARE's answer, not one subscription's: the seven topics ride the
+same links, so one outage interrupts all of them at once. The SDK raises a
+notice per subscription (macula-rust 0.15.0,
+`macula-station#129` phase 1); the transport folds them so an app sees one
+outage rather than seven (macula-craft-collab#45).
+
+The transport holds no document, so it resyncs nothing. An app answers a gap by
+resyncing — re-reading, asking a peer, telling the person the document may be
+behind. The times are hints: an event's `published_at` is its publisher's clock,
+so never drop events whose time falls outside the window.
+
 ## One share per instance
 
 An instance shares one document: its group prefix is minted for it, and it

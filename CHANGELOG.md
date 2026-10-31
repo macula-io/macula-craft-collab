@@ -9,6 +9,22 @@ call.
 
 ### Added
 
+- **A share tells an app what it may have missed** (macula-craft-collab#45, the
+  `Gap` leg 0.9.0 held back). `macula-rust` 0.15.0 makes
+  `Subscription::recv` yield a `Delivery`, so a subscription that lost its last
+  covering link, and one a station carries again, both say so. A share holds
+  seven subscriptions on the same links, so the transport folds the notices
+  into ONE share-level answer instead of handing up seven losses for one
+  outage: `MeshTransport::interrupted()` — why the share is cut off and since
+  when — and `MeshTransport::last_gap()`, the window that may be missing (the
+  earliest moment an interrupted topic last heard from its station, and the
+  moment a station accepted one again), with `MeshTransport::gaps()` counting
+  the outages the share has come back from.
+
+  Nothing is resynced here: the transport holds no document, and the times are
+  the hints the SDK states them as. An app answers a gap by resyncing, never by
+  discarding events whose `published_at` falls outside it.
+
 - **A transport can end the realm memberships it created, and prove it**
   (macula-craft-collab#35). `MeshTransport::resign_memberships()` publishes one
   signed `0x21` record per realm this node holds a membership of — the realm's
