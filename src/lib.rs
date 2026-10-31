@@ -776,6 +776,9 @@ async fn run(thread: MeshThread, in_tx: Sender<Message>) {
                 let _ = reply.send(realm::renew_membership(&pool, &identity, &realm_name, now).await);
             }
             Outbound::RealmResign { reply } => {
+                // Through reign_ended, never straight to resign_every_membership: a
+                // renewal still running beside the resignation can mint the row back
+                // (macula-craft-collab#35 r1). The stop is what makes the proof true.
                 let _ = reply.send(reign_ended(&pool, &identity, &shutdown_tx, &mut renewals).await);
             }
             Outbound::Publish(topic, json) => publish_sealed(&pool, realm, &group, topic, json, &waiting, &arrivals).await,

@@ -20,6 +20,11 @@
 //!   the realm (absent means its own now); sent so the record says what it
 //!   means.
 //!
+//! The record's **subject** is the realm's name (macula-craft-collab#35 r4): a
+//! domain record with no subject keys on its type and signer alone, so a node
+//! resigning two realms would put both records in one DHT slot and the second
+//! would overwrite the first.
+//!
 //! `created_at` comes from the record's own signed envelope, stamped when the
 //! record is built, so a resignation is never refused `no_record_time` and is
 //! never stale against the membership it names. **A record is never reused**:
@@ -33,6 +38,12 @@
 //! until it answers that this row ended. Anything else — `absent`, an error,
 //! no answer inside the deadline — is [`ResignOutcome::Unverified`], which a
 //! sweep must treat as failure. It never reports success it has not seen.
+//!
+//! **A read that fails does not skip the publish** (macula-craft-collab#35 r4).
+//! A realm without #167's status route answers 404 to it, and one whose
+//! projection it cannot read answers 503; either way the realm may hold an
+//! admitted row, and its #169 listener ends the row the record names. So the
+//! record goes out, nothing is pinned, and the outcome stays Unverified.
 
 use std::time::Duration;
 
@@ -53,7 +64,7 @@ pub const RESIGN_RECORD_TYPE: u8 = 0x21;
 pub const READ_MEMBERSHIP_PROCEDURE: &str = "macula_realm.read_realm_membership";
 
 /// Where the realm serves that read: its member-facing host, the body
-/// `{realm_id, member_did, proof}` (macula-realm#167).
+/// `{realm_id, member_did, public_key, proof}` (macula-realm#167).
 pub const READ_MEMBERSHIP_PATH: &str = "/api/v1/memberships/status";
 
 /// How long a resignation waits for the realm to answer that the row ended.
@@ -130,7 +141,15 @@ pub fn resign_record(identity: &Identity, realm_name: &str, resigned_at_ms: u64)
         (Value::text("member_did"), Value::text(identity.node_id())),
         (Value::text("resigned_at"), Value::Int(i128::from(resigned_at_ms))),
     ]);
-    let unsigned = record::envelope(RESIGN_RECORD_TYPE, payload, None, 0).map_err(|e| format!("resignation envelope: {e:?}"))?;
+    // The SUBJECT is the realm's name (macula-craft-collab#35 r4). A domain
+    // record (>= 0x20) with no subject keys on (type, signer) alone
+    // (macula_record.erl:2116), and `resign_all` resigns every realm a node
+    // holds: realm B's record would overwrite realm A's in the DHT, and a
+    // listener of A that missed the 90 s window would never see it. The realm
+    // reads the realm it ends from the payload, so naming the subject changes
+    // nothing on its side.
+    let subject = realm_name.as_bytes().to_vec();
+    let unsigned = record::envelope(RESIGN_RECORD_TYPE, payload, Some(subject), 0).map_err(|e| format!("resignation envelope: {e:?}"))?;
     record::sign(&unsigned, &identity.key()).map_err(|e| format!("resignation sign: {e:?}"))
 }
 
@@ -215,39 +234,82 @@ pub fn outcome_for(realm: &str, pinned: &MembershipStatus, answer: &MembershipSt
 /// that row ended. A membership that is not there is not published for: there
 /// is nothing to end, and the outcome says so.
 pub async fn resign_one(pool: &Pool, identity: &Identity, realm_name: &str, deadline: Duration) -> ResignOutcome {
-    let pinned = match read_membership(identity, realm_name, super::now_ms()).await {
-        Ok(status) => status,
-        Err(why) => return ResignOutcome::Unverified { realm: realm_name.to_string(), why: format!("reading the membership first: {why}") },
-    };
     let now_ms = super::now_ms();
-    match pinned {
+    let first = read_membership(identity, realm_name, now_ms).await;
+
+    match first_move(&first, now_ms) {
         // An earlier run ended this membership and died before forgetting the
         // credential. Nothing is ended now, and the credential goes: left in
         // place it is what the next start would renew, and renewing re-admits.
-        MembershipStatus::Ended { .. } => {
+        FirstMove::AlreadyEnded => {
             super::forget_credential(identity.node_id(), realm_name);
-            ResignOutcome::Unverified { realm: realm_name.to_string(), why: "already ended before this run: nothing was ended now".into() }
+            resign_unverified(realm_name, "already ended before this run: nothing was ended now")
         }
-        // `absent` is red, not "nothing to do": the realm erases rows
-        // (reprojection, the test realm's reset), so an absent answer is also
-        // what a mis-keyed resignation looks like.
-        MembershipStatus::Absent => {
-            ResignOutcome::Unverified { realm: realm_name.to_string(), why: "the realm answers absent: no row to end".into() }
-        }
-        // A realm clock ahead of this one would make the record's signed
-        // moment older than the admission it is meant to end, and the realm
-        // refuses that as stale. Waiting is not this call's business.
-        MembershipStatus::Admitted { admitted_at_ms } if admitted_at_ms > now_ms => ResignOutcome::Unverified {
-            realm: realm_name.to_string(),
-            why: format!("the realm admits this membership at {admitted_at_ms}, ahead of this machine's clock ({now_ms})"),
-        },
-        pinned @ MembershipStatus::Admitted { .. } => {
+        FirstMove::NothingToEnd(why) => resign_unverified(realm_name, why),
+        FirstMove::Publish(pinned) => {
             if let Err(why) = publish(pool, identity, realm_name, now_ms).await {
-                return ResignOutcome::Unverified { realm: realm_name.to_string(), why };
+                return resign_unverified(realm_name, why);
             }
             await_end(identity, realm_name, pinned, deadline).await
         }
+        FirstMove::PublishUnpinned(read_error) => {
+            if let Err(why) = publish(pool, identity, realm_name, now_ms).await {
+                return resign_unverified(realm_name, format!("{read_error}; nothing was published either ({why})"));
+            }
+            await_answer_without_pin(identity, realm_name, deadline, read_error).await
+        }
     }
+}
+
+/// What the first read allows this call to do (macula-craft-collab#35 r4).
+///
+/// **Only a positive answer may skip the publish.** A failed read is not
+/// evidence of no row: a realm without macula-realm#167's status route answers
+/// 404 to it, a projection it cannot read answers 503, and either way the realm
+/// may well hold an admitted membership whose #169 listener ends the row the
+/// record names. Skipping the publish there ended nothing at all, which is what
+/// this crate's own CHANGELOG and harness README promise it does not do.
+///
+/// A publish without a pin cannot be proven to have ended the row this call
+/// meant to end, so its outcome is [`ResignOutcome::Unverified`] whatever the
+/// realm then says. The record is still worth sending: the realm refuses one
+/// written before the admission it names, so an unpinned record cannot end a
+/// later admission by mistake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FirstMove {
+    /// Ended before this run: nothing is published, the credential goes.
+    AlreadyEnded,
+    /// Answered `absent` (red, never a pass), or admitted ahead of this
+    /// machine's clock: nothing is published, and this says why.
+    NothingToEnd(String),
+    /// A read answered a live admission: send the record, and the row it is
+    /// meant to end.
+    Publish(MembershipStatus),
+    /// The read failed: send the record anyway, and this says why nothing can
+    /// be matched to it afterwards.
+    PublishUnpinned(String),
+}
+
+fn first_move(read: &Result<MembershipStatus, String>, now_ms: u64) -> FirstMove {
+    match read {
+        Err(why) => FirstMove::PublishUnpinned(format!("reading the membership first: {why}")),
+        Ok(MembershipStatus::Ended { .. }) => FirstMove::AlreadyEnded,
+        // `absent` is red, not "nothing to do": the realm erases rows
+        // (reprojection, the test realm's reset), so an absent answer is also
+        // what a mis-keyed resignation looks like.
+        Ok(MembershipStatus::Absent) => FirstMove::NothingToEnd("the realm answers absent: no row to end".into()),
+        // A realm clock ahead of this one would make the record's signed
+        // moment older than the admission it is meant to end, and the realm
+        // refuses that as stale. Waiting is not this call's business.
+        Ok(MembershipStatus::Admitted { admitted_at_ms }) if *admitted_at_ms > now_ms => {
+            FirstMove::NothingToEnd(format!("the realm admits this membership at {admitted_at_ms}, ahead of this machine's clock ({now_ms})"))
+        }
+        Ok(pinned @ MembershipStatus::Admitted { .. }) => FirstMove::Publish(*pinned),
+    }
+}
+
+fn resign_unverified(realm_name: &str, why: impl Into<String>) -> ResignOutcome {
+    ResignOutcome::Unverified { realm: realm_name.to_string(), why: why.into() }
 }
 
 /// Builds, signs and puts one fresh resignation record.
@@ -279,6 +341,36 @@ async fn await_end(identity: &Identity, realm_name: &str, pinned: MembershipStat
     }
 }
 
+/// The poll after a record sent without a pin (macula-craft-collab#35 r4):
+/// waits until the realm's answer is no longer a live admission, or the
+/// deadline passes.
+///
+/// Nothing was pinned first, so no answer can be matched to the row this call
+/// meant to end and the outcome is [`ResignOutcome::Unverified`] either way.
+/// What it adds is what the realm said — a teardown log that names the answer
+/// beats one that names only a timeout.
+async fn await_answer_without_pin(identity: &Identity, realm_name: &str, deadline: Duration, read_error: String) -> ResignOutcome {
+    let started = std::time::Instant::now();
+    loop {
+        let answer = read_membership(identity, realm_name, super::now_ms()).await;
+        if let Ok(status) = &answer
+            && !matches!(status, MembershipStatus::Admitted { .. })
+        {
+            return resign_unverified(
+                realm_name,
+                format!("{read_error}; the record was published, and the realm answers {status:?}, which no earlier read pinned"),
+            );
+        }
+        if started.elapsed() >= deadline {
+            return resign_unverified(
+                realm_name,
+                format!("{read_error}; the record was published; no settled answer within {}ms (last answer: {answer:?})", deadline.as_millis()),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(STATUS_POLL_MS)).await;
+    }
+}
+
 /// Asks the realm what it holds about this node's membership of `realm_name`:
 /// a device-signed read of the caller's own row (macula-realm#167).
 pub async fn read_membership(identity: &Identity, realm_name: &str, now_ms: u64) -> Result<MembershipStatus, String> {
@@ -302,8 +394,8 @@ pub fn status_body(identity: &Identity, realm_name: &str) -> Json {
 }
 
 /// One blocking POST of the proof-signed membership read. The signed body is
-/// `{realm_id, member_did}`, so the realm a read is about is inside the proof
-/// and cannot be swapped for another on the way.
+/// `{realm_id, member_did, public_key}`, so the realm a read is about is inside
+/// the proof and cannot be swapped for another on the way.
 pub fn post_status(realm_name: &str, identity: &Identity, now_ms: u64) -> Result<MembershipStatus, String> {
     let body = status_body(identity, realm_name);
     let request = super::proof::canonical_json(&body)?;
@@ -452,6 +544,60 @@ mod tests {
         }
         assert_eq!(outcome_for("net.beam-campus", &pinned, &pinned), None, "still admitted: keep polling");
         assert!(matches!(outcome_for("net.beam-campus", &MembershipStatus::Absent, &ended), Some(ResignOutcome::Unverified { .. })));
+    }
+
+    /// macula-craft-collab#35 r4, required 1: a realm that will not say what it
+    /// holds is still sent the record. Its #169 listener ends the row; only a
+    /// positive answer about a row may skip the publish.
+    #[test]
+    fn a_realm_that_will_not_answer_is_still_sent_the_record() {
+        let now_ms = 1_760_000_000_000;
+
+        let unreadable = Err("the realm answered HTTP 404: no such route".to_string());
+        assert!(
+            matches!(first_move(&unreadable, now_ms), FirstMove::PublishUnpinned(_)),
+            "a failed read is not evidence of no row: the record must still go out"
+        );
+
+        let reached_the_realm = Err("the realm answered HTTP 503: projection unreadable".to_string());
+        assert!(matches!(first_move(&reached_the_realm, now_ms), FirstMove::PublishUnpinned(_)));
+
+        // The answers about a row: an admitted one is published for, and the
+        // row is pinned so its end can be matched.
+        assert_eq!(
+            first_move(&Ok(MembershipStatus::Admitted { admitted_at_ms: 1_000 }), now_ms),
+            FirstMove::Publish(MembershipStatus::Admitted { admitted_at_ms: 1_000 })
+        );
+        // Ended and absent are answered, not guessed at: nothing to publish.
+        assert_eq!(
+            first_move(&Ok(MembershipStatus::Ended { kind: EndKind::Resigned, admitted_at_ms: 1_000, ended_at_ms: None }), now_ms),
+            FirstMove::AlreadyEnded
+        );
+        assert!(matches!(first_move(&Ok(MembershipStatus::Absent), now_ms), FirstMove::NothingToEnd(_)));
+        assert!(
+            matches!(first_move(&Ok(MembershipStatus::Admitted { admitted_at_ms: now_ms + 1 }), now_ms), FirstMove::NothingToEnd(_)),
+            "an admission ahead of this clock cannot be ended by a record stamped now"
+        );
+    }
+
+    /// macula-craft-collab#35 r4, required 2: two realms, two slots. Without a
+    /// subject a domain record keys on (type, signer) alone, so resigning realm
+    /// B would overwrite realm A's record and a listener of A that missed the
+    /// window would never see it.
+    #[test]
+    fn two_realms_are_two_subjects_and_so_two_slots() {
+        let identity = identity();
+        let a = resign_record(&identity, "net.beam-campus", 1_760_000_000_000).expect("record");
+        let b = resign_record(&identity, "io.macula", 1_760_000_000_000).expect("record");
+
+        assert_eq!(a.subject.as_deref(), Some(b"net.beam-campus".as_slice()));
+        assert_eq!(b.subject.as_deref(), Some(b"io.macula".as_slice()));
+        assert_ne!(a.subject, b.subject, "two realms must not share one DHT slot");
+        // Still the same signed shape, and readable the realm's way.
+        assert_eq!(payload_text(&a.payload, "realm_id").as_deref(), Some("net.beam-campus"));
+        let wire = record::encode(&a).expect("wire");
+        let verified = record::verify(&wire, identity.profile(), a.created_at as i64).expect("the record verifies");
+        assert_eq!(verified.record().subject.as_deref(), Some(b"net.beam-campus".as_slice()));
     }
 
     #[test]
