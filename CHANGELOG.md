@@ -5,7 +5,7 @@ All notable changes to this crate are documented here. Format follows
 so a minor version may carry a small breaking change where one was the right
 call.
 
-## [Unreleased]
+## [0.10.0] - 2026-11-01
 
 ### Added
 
