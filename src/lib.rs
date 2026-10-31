@@ -240,10 +240,19 @@ struct CutOffState {
 }
 
 impl CutOff {
+    /// The share's state, recovering a poisoned lock rather than dropping what
+    /// it holds — the idiom the crate's other shared state (`waiting`) already
+    /// uses. A panic that poisoned this lock must never turn a real outage into
+    /// "not interrupted", nor lose the notice that would have said so
+    /// (Venus r=1).
+    fn state(&self) -> std::sync::MutexGuard<'_, CutOffState> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// `topic` lost its last covering link: the share is interrupted from
     /// `notice.from_ms`, which is the earliest of the topics cut off with it.
     fn interrupted(&self, topic: &'static str, notice: Interruption) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let mut state = self.state();
         if !state.topics.insert(topic) {
             return;
         }
@@ -256,7 +265,7 @@ impl CutOff {
     /// `topic` is carried again. The share is back only when no other topic is
     /// still interrupted; the gap it reports covers the whole outage.
     fn gapped(&self, topic: &'static str, notice: Gap) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let mut state = self.state();
         if !state.topics.remove(topic) || !state.topics.is_empty() {
             return;
         }
@@ -268,16 +277,16 @@ impl CutOff {
 
     /// Why the share is cut off now, and since when; `None` when it is not.
     fn now(&self) -> Option<Interruption> {
-        let state = self.inner.lock().ok()?;
+        let state = self.state();
         (!state.topics.is_empty()).then(|| Interruption { from_ms: state.from_ms, reason: state.reason.clone() })
     }
 
     fn last_gap(&self) -> Option<Gap> {
-        self.inner.lock().ok().and_then(|state| state.last_gap.clone())
+        self.state().last_gap.clone()
     }
 
     fn gaps(&self) -> u64 {
-        self.inner.lock().map(|state| state.gaps).unwrap_or(0)
+        self.state().gaps
     }
 }
 
