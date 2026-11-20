@@ -5,6 +5,25 @@ All notable changes to this crate are documented here. Format follows
 so a minor version may carry a small breaking change where one was the right
 call.
 
+## [0.11.0] - 2026-11-20
+
+### Added
+
+- **The largest app payload one publication can carry**
+  (macula-apps/martha-board#2, P2b). `MeshTransport::largest_payload_that_fits(prefix,
+  profile, envelope)` answers how many app bytes an envelope may hold so that
+  no frame is refused by the frame cap, sending or receiving. It is measured
+  by bisection over real sealed frames, against the widest frame a subscriber
+  reads: the PUBLISH, an EVENT or a GOSSIP. The widths of a delivered frame's
+  extra fields are measured through macula-rust's own check, never written
+  down. An app computes it once per share and message kind.
+
+### Changed
+
+- **The seam is `macula-craft-seam` 0.8**, which carries the snapshot's author
+  on `Inbound::Snapshot` and `CollabSession::request_snapshot()`. A match that
+  names every field of `Inbound::Snapshot` changes, so this is a minor release.
+
 ## [0.10.0] - 2026-11-01
 
 ### Added
