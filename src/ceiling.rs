@@ -91,16 +91,18 @@ fn ceiling_with(prefix: &str, profile: Profile, envelope: &Message, accepts: &dy
 /// The longest length `accepts` takes, never past the frame cap. The
 /// shortest accepted length is found first, scanned upward from 1 to
 /// `scan_until` (a bound on time only); then the length is doubled until
-/// refused and bisected. The accepted lengths are taken to be one run, as
-/// every length rule of the wire is. A length still accepted at the cap is an
+/// refused or at the cap, and bisected, so the search ends whatever the
+/// check accepts. The accepted lengths are taken to be one run, as every
+/// length rule of the wire is. A length still accepted at the cap is an
 /// error: no frame could bound that field.
 fn longest_accepted(scan_until: usize, accepts: &dyn Fn(usize) -> bool) -> Result<usize, String> {
     let shortest = (1..=scan_until).find(|&len| accepts(len)).ok_or("macula-rust accepts no length of a delivered field this crate can find")?;
     if accepts(MAX_FRAME_BYTES) {
         return Err("macula-rust accepts a delivered field this crate cannot bound".into());
     }
-    let over =
-        std::iter::successors(Some(shortest), |&len| Some((len * 2).min(MAX_FRAME_BYTES))).find(|&len| !accepts(len)).unwrap_or(MAX_FRAME_BYTES);
+    let over = std::iter::successors(Some(shortest), |&len| (len < MAX_FRAME_BYTES).then(|| (len * 2).min(MAX_FRAME_BYTES)))
+        .find(|&len| !accepts(len))
+        .unwrap_or(MAX_FRAME_BYTES);
     largest_accepted(shortest, over, |len| Ok(accepts(len)))
 }
 
