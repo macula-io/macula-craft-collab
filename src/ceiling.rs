@@ -70,16 +70,38 @@ impl MeshTransport {
     /// An envelope of another kind has no app bytes and is refused, as is
     /// one that is over the cap with no app bytes at all.
     pub fn largest_payload_that_fits(prefix: &str, profile: Profile, envelope: &Message) -> Result<usize, String> {
-        let mut probe = Probe::new(prefix, profile, envelope)?;
-        probe.widest = Widest::measure(&probe, profile)?;
-        if !probe.fits(0)? {
-            return Err(format!("the envelope alone is over the {MAX_FRAME_BYTES}-byte frame cap"));
-        }
-        // Each app byte adds at least its JSON width to the frame (the seal
-        // and the CBOR only add to it), so this many never fit.
-        let over_bound = MAX_FRAME_BYTES / json_width_of_a_byte()? + 2;
-        largest_accepted(0, over_bound, |n| probe.fits(n))
+        ceiling_with(prefix, profile, envelope, &|frame| frame::verify_publication(frame, profile, now_of_the_probe()).is_ok())
     }
+}
+
+/// [`MeshTransport::largest_payload_that_fits`] with the subscriber's check
+/// given, so a test can stand another in for it.
+fn ceiling_with(prefix: &str, profile: Profile, envelope: &Message, accepts: &dyn Fn(&Value) -> bool) -> Result<usize, String> {
+    let mut probe = Probe::new(prefix, profile, envelope)?;
+    probe.widest = Widest::measure(&probe, accepts)?;
+    if !probe.fits(0)? {
+        return Err(format!("the envelope alone is over the {MAX_FRAME_BYTES}-byte frame cap"));
+    }
+    // Each app byte adds at least its JSON width to the frame (the seal and
+    // the CBOR only add to it), so this many never fit.
+    let over_bound = MAX_FRAME_BYTES / json_width_of_a_byte()? + 2;
+    largest_accepted(0, over_bound, |n| probe.fits(n))
+}
+
+/// The longest length `accepts` takes, never past the frame cap. The
+/// shortest accepted length is found first, scanned upward from 1 to
+/// `scan_until` (a bound on time only); then the length is doubled until
+/// refused and bisected. The accepted lengths are taken to be one run, as
+/// every length rule of the wire is. A length still accepted at the cap is an
+/// error: no frame could bound that field.
+fn longest_accepted(scan_until: usize, accepts: &dyn Fn(usize) -> bool) -> Result<usize, String> {
+    let shortest = (1..=scan_until).find(|&len| accepts(len)).ok_or("macula-rust accepts no length of a delivered field this crate can find")?;
+    if accepts(MAX_FRAME_BYTES) {
+        return Err("macula-rust accepts a delivered field this crate cannot bound".into());
+    }
+    let over =
+        std::iter::successors(Some(shortest), |&len| Some((len * 2).min(MAX_FRAME_BYTES))).find(|&len| !accepts(len)).unwrap_or(MAX_FRAME_BYTES);
+    largest_accepted(shortest, over, |len| Ok(accepts(len)))
 }
 
 /// The largest `n` in `fits..over` that `accepted` takes, by bisection:
@@ -181,29 +203,18 @@ struct Widest {
 }
 
 impl Widest {
-    /// Measures the widths on the envelope's own PUBLISH with no app bytes,
-    /// then has the check accept the widest EVENT and GOSSIP built with them.
-    fn measure(probe: &Probe, profile: Profile) -> Result<Widest, String> {
+    /// Measures each width as the longest the check `accepts` takes, on the
+    /// envelope's own PUBLISH with no app bytes, then has it accept the
+    /// widest EVENT and GOSSIP built with them (design r=6). The shortest
+    /// accepted length is looked for no further than that frame's own length.
+    fn measure(probe: &Probe, accepts: &dyn Fn(&Value) -> bool) -> Result<Widest, String> {
         let small = probe.signed(0)?.ok_or("the envelope alone is over the frame cap")?;
         let small_len = cbor::encode(&small).map_err(|e| format!("the frame: {e:?}"))?.len();
-        let accepts = |frame: &Value| frame::verify_publication(frame, profile, now_of_the_probe()).is_ok();
-        // A frame_id has one accepted length; none longer than the frame it
-        // rides on is looked for.
-        let frame_id = (1..=small_len)
-            .find(|&len| accepts(&delivered(&small, GOSSIP, vec![round(), (Value::text(FRAME_ID), Value::Bytes(vec![0; len]))])))
-            .ok_or("macula-rust accepts no frame_id this crate can measure")?;
+        let id = |len: usize| delivered(&small, GOSSIP, vec![round(), (Value::text(FRAME_ID), Value::Bytes(vec![0; len]))]);
         let via = |len: usize| delivered(&small, EVENT, vec![(Value::text(DELIVERED_VIA), Value::text("x".repeat(len)))]);
-        if !accepts(&via(1)) {
-            return Err("macula-rust no longer accepts the delivered frame this crate measures".into());
-        }
-        // The longest delivered_via accepted: doubled until refused, then
-        // bisected, never past the cap.
-        let mut over = 2;
-        while over <= MAX_FRAME_BYTES && accepts(&via(over)) {
-            over *= 2;
-        }
-        let longest = largest_accepted(over / 2, over, |len| Ok(accepts(&via(len))))?;
-        let widest = Widest { delivered_via: longest, frame_id };
+        let frame_id = longest_accepted(small_len, &|len| accepts(&id(len)))?;
+        let delivered_via = longest_accepted(small_len, &|len| accepts(&via(len)))?;
+        let widest = Widest { delivered_via, frame_id };
         if !accepts(&widest.event(&small)) || !accepts(&widest.gossip(&small)) {
             return Err("macula-rust no longer accepts the delivered frame this crate measures".into());
         }
@@ -280,6 +291,11 @@ mod tests {
     /// the ceiling's own measuring, and each one accepted by the subscriber's
     /// check.
     fn widest_received_len(msg: Message, profile: Profile) -> usize {
+        received_len(msg, profile, DELIVERED_VIA_BYTES)
+    }
+
+    /// The same, with an EVENT whose `delivered_via` is `via` bytes long.
+    fn received_len(msg: Message, profile: Profile, via: usize) -> usize {
         let (out, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut transport = transport_with(out, Arc::new(|| 0));
         transport.send(msg).expect("sent");
@@ -295,8 +311,8 @@ mod tests {
         let spec = PublicationSpec { realm, topic, seq: widest, published_at: widest, payload: Payload::Sealed(sealed), ttl_ms: None };
         let publish = frame::sign_publish(&spec, &key).expect("signed");
         let now = i64::try_from(widest).expect("fits");
-        let frames =
-            [publish.clone(), widest_event(&publish, Value::Int(i128::from(widest))), widest_gossip(&publish, Value::Int(i128::from(widest)))];
+        let int = Value::Int(i128::from(widest));
+        let frames = [publish.clone(), event_with(&publish, int.clone(), via), widest_gossip(&publish, int)];
         for f in &frames {
             frame::verify_publication(f, profile, now).expect("a subscriber reads it");
         }
@@ -320,14 +336,14 @@ mod tests {
     }
 
     fn widest_event(publish: &Value, int: Value) -> Value {
+        event_with(publish, int, DELIVERED_VIA_BYTES)
+    }
+
+    fn event_with(publish: &Value, int: Value, via: usize) -> Value {
         with(
             publish,
             "event",
-            vec![
-                ("delivered_via", Value::text("d".repeat(DELIVERED_VIA_BYTES))),
-                ("frame_id", Value::Bytes(vec![1; FRAME_ID_BYTES])),
-                ("sent_at_ms", int),
-            ],
+            vec![("delivered_via", Value::text("d".repeat(via))), ("frame_id", Value::Bytes(vec![1; FRAME_ID_BYTES])), ("sent_at_ms", int)],
         )
     }
 
@@ -408,5 +424,36 @@ mod tests {
         let msg = envelope(Kind::CursorMoved { position: None, name: None });
         let err = MeshTransport::largest_payload_that_fits("io.macula/~aabbcc/craft/9f9f", Profile::PqPure, &msg).expect_err("refused");
         assert!(err.contains("no app bytes"), "{err}");
+    }
+
+    /// Design r=6: a width is the longest length the check accepts, never
+    /// the first, and a field the check never stops accepting is an error.
+    #[test]
+    fn each_width_is_the_longest_the_check_accepts() {
+        let scan = 100;
+        assert_eq!(longest_accepted(scan, &|len| (1..=32).contains(&len)), Ok(32), "a run from 1 gives its upper end");
+        assert_eq!(longest_accepted(scan, &|len| len == 16), Ok(16), "one length gives that length");
+        assert_eq!(longest_accepted(scan, &|len| (17..=20).contains(&len)), Ok(20), "a run above 1 gives its upper end");
+        let unbounded = longest_accepted(scan, &|_| true).expect_err("no cap");
+        assert!(unbounded.contains("cannot bound"), "{unbounded}");
+        let none = longest_accepted(scan, &|_| false).expect_err("none accepted");
+        assert!(none.contains("no length"), "{none}");
+    }
+
+    /// When an EVENT's `delivered_via` may be only one byte, the GOSSIP is
+    /// the widest frame, and the ceiling must fit it too: a stand-in check
+    /// over the real one makes it so, since 0.15's EVENT is always wider.
+    #[test]
+    fn the_gossip_binds_when_it_is_the_widest_frame() {
+        let profile = Profile::PqPure;
+        let msg = envelope(Kind::Command { id: "board.server".into(), params: Vec::new(), anchor: None });
+        let prefix = transport_with(tokio::sync::mpsc::unbounded_channel().0, Arc::new(|| 0)).prefix.clone();
+        let real = |f: &Value| frame::verify_publication(f, profile, now_of_the_probe()).is_ok();
+        let short_via = |f: &Value| real(f) && f.get("delivered_via").is_none_or(|v| matches!(v, Value::Text(t) if t.len() <= 1));
+        let n = ceiling_with(&prefix, profile, &msg, &short_via).expect("measured");
+        let at = received_len(with_bytes(msg.clone(), n), profile, 1);
+        let over = received_len(with_bytes(msg, n + 1), profile, 1);
+        assert!(at <= MAX_FRAME_BYTES, "{n} app bytes make a {at}-byte frame, over the cap");
+        assert!(over > MAX_FRAME_BYTES, "{} app bytes make a {over}-byte frame, still under the cap", n + 1);
     }
 }
