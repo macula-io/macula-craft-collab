@@ -458,4 +458,19 @@ mod tests {
         assert!(at <= MAX_FRAME_BYTES, "{n} app bytes make a {at}-byte frame, over the cap");
         assert!(over > MAX_FRAME_BYTES, "{} app bytes make a {over}-byte frame, still under the cap", n + 1);
     }
+
+    /// The search, on macula-rust's real check, finds the widths 0.15 has:
+    /// a dependency that changes either shape (a gapped set of lengths the
+    /// search would measure short, say) fails here by name.
+    #[test]
+    fn the_real_check_measures_the_widths_this_macula_rust_has() {
+        let profile = Profile::PqPure;
+        let msg = envelope(Kind::Command { id: "board.server".into(), params: Vec::new(), anchor: None });
+        let prefix = transport_with(tokio::sync::mpsc::unbounded_channel().0, Arc::new(|| 0)).prefix.clone();
+        let real = |f: &Value| frame::verify_publication(f, profile, now_of_the_probe()).is_ok();
+        let probe = Probe::new(&prefix, profile, &msg).expect("probe");
+        let widest = Widest::measure(&probe, &real).expect("measured");
+        assert_eq!(widest.delivered_via, DELIVERED_VIA_BYTES, "delivered_via");
+        assert_eq!(widest.frame_id, FRAME_ID_BYTES, "frame_id");
+    }
 }
