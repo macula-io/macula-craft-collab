@@ -16,6 +16,7 @@
 //! in this crate: a publication that is not under a sealed group is a bug, not
 //! a fallback.
 
+mod ceiling;
 pub mod craft_mesh;
 pub mod grant;
 pub mod identity;
@@ -897,7 +898,7 @@ async fn publish_sealed(
     waiting: &Arc<Mutex<Option<Reason>>>,
     arrivals: &Arrivals,
 ) {
-    let payload = Value::Map(vec![(Value::text("json"), Value::text(json))]);
+    let payload = wire_payload(json);
     match pool.publish_group(&realm, &topic, group, payload).await {
         Ok(()) => note_sharing(waiting, None),
         Err(e) => {
@@ -909,6 +910,19 @@ async fn publish_sealed(
             }
         }
     }
+}
+
+/// The payload a seam message's JSON travels in, sealed: `{"json": text}`.
+/// One function, so the frame ceiling ([`MeshTransport::largest_payload_that_fits`])
+/// measures the wrapping a publication really gets.
+fn wire_payload(json: String) -> Value {
+    Value::Map(vec![(Value::text("json"), Value::text(json))])
+}
+
+/// A seam message as the JSON its publication carries. Shared by
+/// [`MeshTransport`]'s `send` and the frame ceiling, for the same reason.
+fn wire_json(msg: &Message) -> Result<String, String> {
+    serde_json::to_string(msg).map_err(|e| e.to_string())
 }
 
 /// Why a publication or an event says this node is not in its share, when it
@@ -1166,11 +1180,11 @@ impl Transport for MeshTransport {
         // the mesh thread gone (its channel is closed once it has ended).
         // The seam ignores this answer, so counting it here is the only way
         // the app is told (macula-craft-collab#39).
-        let json = match serde_json::to_string(&msg) {
+        let json = match wire_json(&msg) {
             Ok(json) => json,
             Err(e) => {
                 self.arrivals.refused_outbound.fetch_add(1, Ordering::Relaxed);
-                return Err(e.to_string());
+                return Err(e);
             }
         };
         self.work()?.send(Outbound::Publish(topic, json)).map_err(|_| {
@@ -1308,7 +1322,7 @@ mod tests {
     /// A transport whose outbound channel is `out`, with the pool's count
     /// answered by `pool_unsent`: everything the two tests below need, and
     /// nothing that dials a station.
-    fn transport_with(out: UnboundedSender<Outbound>, pool_unsent: PoolUnsent) -> MeshTransport {
+    pub(crate) fn transport_with(out: UnboundedSender<Outbound>, pool_unsent: PoolUnsent) -> MeshTransport {
         let (_in_tx, incoming) = arriving();
         MeshTransport {
             author: "aabbcc".into(),

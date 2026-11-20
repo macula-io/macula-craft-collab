@@ -167,7 +167,7 @@ fn tick(session: &mut CollabSession) {
             Inbound::Text { update, .. } => {
                 session.texts_mut().apply_doc_update(&update).expect("a peer's update applies");
             }
-            Inbound::Snapshot { data, crdt } => {
+            Inbound::Snapshot { data, crdt, .. } => {
                 session.texts_mut().apply_doc_update(&data).expect("the peer's document applies");
                 session.snapshot_loaded(&crdt);
             }

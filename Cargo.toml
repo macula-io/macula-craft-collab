@@ -31,7 +31,10 @@ workspace = true
 
 [dependencies]
 # the collaboration seam (code keeps the craft_collab name)
-craft-collab = { package = "macula-craft-seam", version = "0.7" }
+# On seam main's P2a commit through git until macula-craft-seam 0.8.0 is
+# published (the snapshot's author, `request_snapshot`; macula-apps/martha-board#2
+# P2a). It goes back to the registry version before this branch is handed off.
+craft-collab = { package = "macula-craft-seam", git = "https://github.com/rgfaber/craft-libs", rev = "01395ed32c0f9b83b88c7bb9c4e3061c294a4a19" }
 # released crates only
 # 0.15.0 is what a share can tell an app with: Subscription::recv yields a
 # Delivery, so a subscription that may have missed events says so
